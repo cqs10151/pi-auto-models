@@ -330,8 +330,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("quota", {
     description: "显示 Claude / Codex 5h 额度使用情况",
     handler: async (_args, ctx) => {
-      const auth = readAuth();
-      const lines: string[] = [];
+      // ponytail: 跨 await 不再读 ctx，避免 reload 后 stale；只捕获 UI 对象
+      const ui = ctx.ui;
+      ui.setWorkingMessage("查询额度中…");
+      ui.setWorkingVisible(true);
+      try {
+        const auth = readAuth();
+        const lines: string[] = [];
 
       for (const [provider, label] of [
         [CLAUDE_PROVIDER, "Claude"],
@@ -417,7 +422,11 @@ export default function (pi: ExtensionAPI) {
         lines.push("");
       }
 
-      ctx.ui.notify(lines.join("\n"), "info");
+        ui.notify(lines.join("\n"), "info");
+      } finally {
+        ui.setWorkingVisible(false);
+        ui.setWorkingMessage(undefined);
+      }
     },
   });
 
