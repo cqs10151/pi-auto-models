@@ -8,13 +8,14 @@
  * 通过缓存限额过期时间避免重复检查。
  * 通过 after_provider_response 检测 429 自动切换并缓存。
  *
- * /quota 命令查看各 provider 的 5h 额度使用情况。
+ * /usage 命令查看各 provider 的 5h 额度使用情况。
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getPassiveRateLimitCooldownMs, type RateLimitInfo } from "./quota-utils.ts";
 
 // ── Types ──
 
@@ -24,19 +25,6 @@ interface ProviderQuota {
 
 /** 按 provider 存储限额缓存 */
 type QuotaCache = Record<string, ProviderQuota>;
-
-interface RateLimitInfo {
-  utilization?: string;
-  status?: string;
-  reset?: string;
-  requestsLimit?: string;
-  requestsRemaining?: string;
-  requestsReset?: string;
-  tokensLimit?: string;
-  tokensRemaining?: string;
-  tokensReset?: string;
-  capturedAt: number;
-}
 
 interface AuthEntry {
   type: string;
@@ -108,13 +96,6 @@ function setProviderRateLimit(provider: string, expiresAt: number): void {
   const cache = readCache();
   cache[provider] = { rateLimitExpiresAt: expiresAt };
   writeCache(cache);
-}
-
-function isProviderRateLimited(provider: string): boolean {
-  const cache = readCache();
-  const entry = cache[provider];
-  if (!entry) return false;
-  return Date.now() < entry.rateLimitExpiresAt;
 }
 
 function getProviderRateLimitLeft(provider: string): number {
@@ -303,7 +284,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    if (isProviderRateLimited(CLAUDE_PROVIDER)) {
+    ctx.ui.setWorkingVisible(true);
+    const claudeCooldownMs = Math.max(
+      getProviderRateLimitLeft(CLAUDE_PROVIDER),
+      getPassiveRateLimitCooldownMs(rateLimits.get(CLAUDE_PROVIDER)),
+    );
+    if (claudeCooldownMs > 0) {
+      setProviderRateLimit(CLAUDE_PROVIDER, Date.now() + claudeCooldownMs);
       const ok = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);
       if (ok) {
         usingClaude = false;
@@ -325,15 +312,16 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── /quota 命令 ──
+  // ── /usage 命令 ──
 
-  pi.registerCommand("quota", {
+  pi.registerCommand("usage", {
     description: "显示 Claude / Codex 5h 额度使用情况",
     handler: async (_args, ctx) => {
       // ponytail: 跨 await 不再读 ctx，避免 reload 后 stale；只捕获 UI 对象
       const ui = ctx.ui;
       ui.setWorkingMessage("查询额度中…");
       ui.setWorkingVisible(true);
+      ui.setStatus("auto-model-usage", ui.theme.fg("warning", "⏳ 查询额度中…"));
       try {
         const auth = readAuth();
         const lines: string[] = [];
@@ -366,7 +354,9 @@ export default function (pi: ExtensionAPI) {
         const codexPrimary = codexUsage?.rate_limit?.primary_window;
 
         // 限额状态（两个 provider 都支持）
-        const left = getProviderRateLimitLeft(provider);
+        const passiveLeft = getPassiveRateLimitCooldownMs(rateLimits.get(provider));
+        if (passiveLeft > 0) setProviderRateLimit(provider, Date.now() + passiveLeft);
+        const left = Math.max(getProviderRateLimitLeft(provider), passiveLeft);
         if (codexUsage?.rate_limit?.limit_reached && codexPrimary) {
           lines.push(`  📊 ❌ 限额中，${formatTimeLeft(codexPrimary.reset_after_seconds * 1000)} 后恢复`);
           setProviderRateLimit(provider, codexPrimary.reset_at * 1000);
@@ -414,7 +404,7 @@ export default function (pi: ExtensionAPI) {
           } else if (rl.tokensReset) {
             lines.push(`  🔄 窗口重置: ${rl.tokensReset}`);
           }
-          lines.push(`  ⏱  数据时间: ${formatAge(rl.capturedAt)}`);
+          lines.push(`  ⏱  数据时间: ${formatAge(rl.capturedAt ?? Date.now())}`);
         } else {
           lines.push(codexUsageError ? `  📈 获取额度失败: ${codexUsageError}` : "  📈 使用后自动获取额度详情");
         }
@@ -424,8 +414,9 @@ export default function (pi: ExtensionAPI) {
 
         ui.notify(lines.join("\n"), "info");
       } finally {
-        ui.setWorkingVisible(false);
+        ui.setWorkingVisible(true);
         ui.setWorkingMessage(undefined);
+        ui.setStatus("auto-model-usage", undefined);
       }
     },
   });
@@ -442,6 +433,8 @@ export default function (pi: ExtensionAPI) {
       if (info) {
         rateLimits.set(provider, info);
         writeRateLimits(rateLimits);
+        const passiveLeft = getPassiveRateLimitCooldownMs(info);
+        if (passiveLeft > 0) setProviderRateLimit(provider, Date.now() + passiveLeft);
       }
     }
 
