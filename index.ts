@@ -384,7 +384,7 @@ export default function (pi: ExtensionAPI) {
           if (codexSecondary) {
             lines.push(`  🔄 周窗口重置: ${formatReset(codexSecondary.reset_at)}`);
           }
-          lines.push(`  ⏱  实时查询`);
+          lines.push(`  ⏰ 实时查询`);
           lines.push("");
           continue;
         }
@@ -423,7 +423,7 @@ export default function (pi: ExtensionAPI) {
           if (!rl.reset && !rl.weeklyReset && rl.tokensReset) {
             lines.push(`  🔄 窗口重置: ${rl.tokensReset}`);
           }
-          lines.push(`  ⏱  数据时间: ${formatAge(rl.capturedAt ?? Date.now())}`);
+          lines.push(`  ⏰ 数据时间: ${formatAge(rl.capturedAt ?? Date.now())}`);
         } else {
           lines.push(codexUsageError ? `  📈 获取额度失败: ${codexUsageError}` : "  📈 使用后自动获取额度详情");
         }
