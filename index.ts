@@ -519,9 +519,39 @@ export default function (pi: ExtensionAPI) {
       });
       if (!slot) return;
 
-      // 选模型（支持模糊搜索）
+      // 选模型（fzf 模糊搜索）
       const model = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         let filter = "";
+
+        // ponytail: fzf-style 模糊匹配，按字符顺序匹配，不要求连续
+        const fzfMatch = (text: string, pattern: string): number => {
+          if (!pattern) return 1;
+          const lower = text.toLowerCase();
+          const p = pattern.toLowerCase();
+          let j = 0;
+          for (let i = 0; i < lower.length && j < p.length; i++) {
+            if (lower[i] === p[j]) j++;
+          }
+          return j === p.length ? 1 : 0;
+        };
+
+        const rebuildList = () => {
+          const filtered = filter
+            ? modelItems.filter((item) => fzfMatch(item.label, filter))
+            : modelItems;
+          // 重建 SelectList
+          container.removeChild(list);
+          container.removeChild(helpText);
+          container.removeChild(bottomBorder);
+          list = new SelectList(filtered, Math.min(filtered.length, 12), selectTheme);
+          list.onSelect = (item) => done(item.value);
+          list.onCancel = () => done(null);
+          container.addChild(list);
+          container.addChild(helpText);
+          container.addChild(bottomBorder);
+          container.invalidate();
+        };
+
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
         const titleText = new Text("", 1, 0);
@@ -532,18 +562,21 @@ export default function (pi: ExtensionAPI) {
         };
         updateTitle();
         container.addChild(titleText);
-        const list = new SelectList(modelItems, Math.min(modelItems.length, 12), {
-          selectedPrefix: (t) => theme.fg("accent", t),
-          selectedText: (t) => theme.fg("accent", t),
-          description: (t) => theme.fg("muted", t),
-          scrollInfo: (t) => theme.fg("dim", t),
-          noMatch: (t) => theme.fg("warning", t),
-        });
+        const selectTheme = {
+          selectedPrefix: (t: string) => theme.fg("accent", t),
+          selectedText: (t: string) => theme.fg("accent", t),
+          description: (t: string) => theme.fg("muted", t),
+          scrollInfo: (t: string) => theme.fg("dim", t),
+          noMatch: (t: string) => theme.fg("warning", t),
+        };
+        let list = new SelectList(modelItems, Math.min(modelItems.length, 12), selectTheme);
         list.onSelect = (item) => done(item.value);
         list.onCancel = () => done(null);
         container.addChild(list);
-        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • 输入搜索 • enter 确认 • esc 取消"), 1, 0));
-        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        const helpText = new Text(theme.fg("dim", "↑↓ 选择 • 输入搜索 • enter 确认 • esc 取消"), 1, 0);
+        container.addChild(helpText);
+        const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+        container.addChild(bottomBorder);
         return {
           render: (w) => container.render(w),
           invalidate: () => container.invalidate(),
@@ -551,15 +584,13 @@ export default function (pi: ExtensionAPI) {
             if (matchesKey(data, Key.backspace)) {
               if (filter.length > 0) {
                 filter = filter.slice(0, -1);
-                list.setFilter(filter);
                 updateTitle();
-                container.invalidate();
+                rebuildList();
               }
             } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
               filter += data;
-              list.setFilter(filter);
               updateTitle();
-              container.invalidate();
+              rebuildList();
             } else {
               list.handleInput(data);
             }
