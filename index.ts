@@ -16,7 +16,7 @@ import { join, dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Text, SelectList, type SelectItem, matchesKey, Key } from "@earendil-works/pi-tui";
-import { getPassiveRateLimitCooldownMs, type RateLimitInfo } from "./quota-utils.ts";
+import { getPassiveRateLimitCooldownMs, isProviderRateLimitError, isRateLimitInfoStale, parseCooldownMs, type RateLimitInfo } from "./quota-utils.ts";
 
 // ── Types ──
 
@@ -84,9 +84,6 @@ function writeConfig(cfg: AutoModelConfig): void {
 const AUTH_FILE = join(getAgentDir(), "auth.json");
 const CACHE_FILE = join(getAgentDir(), "claude-quota-cache.json");
 const RATE_LIMIT_FILE = join(getAgentDir(), "auto-model-rate-limits.json");
-// ponytail: 默认 5 小时冷却，Claude/Codex 限额周期通常是 5h，按实际 retry-after 覆盖
-const DEFAULT_COOLDOWN_MS = 5 * 60 * 60 * 1000;
-
 const DEFAULT_PRIMARY_PROVIDER = "anthropic";
 const DEFAULT_PRIMARY_MODEL = "claude-opus-4-6";
 const DEFAULT_PRIMARY_THINKING: ThinkingLevel = "high";
@@ -282,27 +279,6 @@ function formatReset(reset: string | number): string {
   return String(reset);
 }
 
-// ponytail: 从 retry-after / retry-after-ms header 解析冷却毫秒数
-function parseCooldownMs(headers: Record<string, string> | undefined): number {
-  if (!headers) return DEFAULT_COOLDOWN_MS;
-  const reset = headers["anthropic-ratelimit-unified-5h-reset"] ?? headers["anthropic-ratelimit-unified-reset"];
-  if (reset) {
-    const seconds = Number(reset);
-    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000 - Date.now());
-  }
-  const retryAfterMs = headers["retry-after-ms"];
-  if (retryAfterMs) {
-    const ms = Number(retryAfterMs);
-    if (!Number.isNaN(ms) && ms > 0) return ms;
-  }
-  const retryAfter = headers["retry-after"];
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (!Number.isNaN(seconds) && seconds > 0) return seconds * 1000;
-  }
-  return DEFAULT_COOLDOWN_MS;
-}
-
 // ── Extension ──
 
 export default function (pi: ExtensionAPI) {
@@ -347,6 +323,32 @@ export default function (pi: ExtensionAPI) {
           usingClaude = false;
           ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
         }
+      }
+    }
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    if (event.message.role !== "assistant") return;
+    if (!isProviderRateLimitError(event.message.errorMessage)) return;
+    const provider = event.message.provider ?? lastRequestProvider ?? ctx.model?.provider;
+    if (!provider) return;
+
+    const cooldownMs = parseCooldownMs(undefined);
+    setProviderRateLimit(provider, Date.now() + cooldownMs);
+    rateLimits.set(provider, {
+      utilization: "1",
+      status: "rate_limited",
+      reset: String(Math.ceil((Date.now() + cooldownMs) / 1000)),
+      capturedAt: Date.now(),
+    });
+    writeRateLimits(rateLimits);
+
+    if (usingClaude && provider === CLAUDE_PROVIDER) {
+      const ok = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);
+      if (ok) {
+        usingClaude = false;
+        ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
+        ctx.ui.notify(`Claude 限额，已切换到 ${FALLBACK_MODEL}`, "warning");
       }
     }
   });
@@ -396,6 +398,8 @@ export default function (pi: ExtensionAPI) {
         const passiveLeft = getPassiveRateLimitCooldownMs(rateLimits.get(provider));
         if (passiveLeft > 0) setProviderRateLimit(provider, Date.now() + passiveLeft);
         const left = Math.max(getProviderRateLimitLeft(provider), passiveLeft);
+        const rl = rateLimits.get(provider);
+        const stale = isRateLimitInfoStale(rl);
         if (codexUsage?.rate_limit?.limit_reached && codexPrimary) {
           lines.push(`  📊 ❌ 限额中，${formatTimeLeft(codexPrimary.reset_after_seconds * 1000)} 后恢复`);
           setProviderRateLimit(provider, codexPrimary.reset_at * 1000);
@@ -403,6 +407,8 @@ export default function (pi: ExtensionAPI) {
           lines.push("  📊 ✅ 额度可用");
         } else if (left > 0) {
           lines.push(`  📊 ❌ 限额中，${formatTimeLeft(left)} 后恢复`);
+        } else if (stale || (provider === CLAUDE_PROVIDER && !rl)) {
+          lines.push("  📊 额度未知");
         } else {
           lines.push("  📊 ✅ 额度可用");
         }
@@ -426,8 +432,9 @@ export default function (pi: ExtensionAPI) {
         }
 
         // Claude 从响应 headers 被动捕获
-        const rl = rateLimits.get(provider);
-        if (rl) {
+        if (stale) {
+          lines.push("  📈 旧数据已过期，使用后自动获取额度详情");
+        } else if (rl) {
           if (rl.utilization) {
             const pct = Math.round(Number(rl.utilization) * 100);
             lines.push(`  📈 5h 额度: ${makeBar(pct)} ${pct}%${rl.status ? ` (${rl.status})` : ""}`);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { getPassiveRateLimitCooldownMs } from './quota-utils.ts';
+import { getPassiveRateLimitCooldownMs, isProviderRateLimitError, isRateLimitInfoStale, parseCooldownMs } from './quota-utils.ts';
 
 test('avoids Claude when passive 5h utilization is effectively exhausted', () => {
   const now = 1_700_000_000_000;
@@ -15,6 +15,39 @@ test('avoids Claude when passive 5h utilization is effectively exhausted', () =>
 
 test('does not avoid Claude for lower passive utilization warnings', () => {
   assert.equal(getPassiveRateLimitCooldownMs({ utilization: '0.98', status: 'allowed_warning' }, 1_700_000_000_000), 0);
+});
+
+test('treats passive rate limit data older than its window as stale', () => {
+  const now = 1_700_000_000_000;
+
+  assert.equal(isRateLimitInfoStale({ capturedAt: now - 5 * 60 * 60 * 1000 - 1 }, now), true);
+  assert.equal(isRateLimitInfoStale({ capturedAt: now - 60_000 }, now), false);
+});
+
+test('/usage hides stale passive Claude quota snapshots', () => {
+  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+
+  assert.match(source, /isRateLimitInfoStale/);
+  assert.match(source, /额度未知/);
+  assert.match(source, /旧数据已过期/);
+});
+
+test('falls back when 429 reset header is already stale', () => {
+  const now = 1_700_000_000_000;
+
+  assert.equal(parseCooldownMs({ 'anthropic-ratelimit-unified-5h-reset': String(now / 1000 - 60) }, now, 1234), 1234);
+});
+
+test('detects provider rate limit errors without response headers', () => {
+  assert.equal(isProviderRateLimitError('429 {"error":{"type":"rate_limit_error"}}'), true);
+  assert.equal(isProviderRateLimitError('Retry failed after 2 attempts: Retry cancelled'), false);
+});
+
+test('message_end caches Anthropic 429 errors when headers are unavailable', () => {
+  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+
+  assert.match(source, /pi\.on\("message_end"/);
+  assert.match(source, /isProviderRateLimitError/);
 });
 
 test('/usage shows visible loading while querying', () => {
