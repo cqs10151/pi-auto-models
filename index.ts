@@ -51,6 +51,26 @@ interface CodexUsage {
   };
 }
 
+// ── Config ──
+
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+interface AutoModelConfig {
+  primary?: { provider?: string; model?: string; thinking?: ThinkingLevel };
+  fallback?: { provider?: string; model?: string; thinking?: ThinkingLevel };
+}
+
+const CONFIG_FILE = join(getAgentDir(), "auto-model.json");
+
+function readConfig(): AutoModelConfig {
+  try {
+    if (!existsSync(CONFIG_FILE)) return {};
+    return JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as AutoModelConfig;
+  } catch {
+    return {};
+  }
+}
+
 // ── Constants ──
 
 const AUTH_FILE = join(getAgentDir(), "auth.json");
@@ -59,13 +79,13 @@ const RATE_LIMIT_FILE = join(getAgentDir(), "auto-model-rate-limits.json");
 // ponytail: 默认 5 小时冷却，Claude/Codex 限额周期通常是 5h，按实际 retry-after 覆盖
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 60 * 1000;
 
-const CLAUDE_PROVIDER = "anthropic";
-const CLAUDE_MODEL = "claude-opus-4-6";
-const CLAUDE_THINKING: "high" = "high";
+const DEFAULT_PRIMARY_PROVIDER = "anthropic";
+const DEFAULT_PRIMARY_MODEL = "claude-opus-4-6";
+const DEFAULT_PRIMARY_THINKING: ThinkingLevel = "high";
 
-const FALLBACK_PROVIDER = "openai-codex";
-const FALLBACK_MODEL = "gpt-5.5";
-const FALLBACK_THINKING: "high" = "high";
+const DEFAULT_FALLBACK_PROVIDER = "openai-codex";
+const DEFAULT_FALLBACK_MODEL = "gpt-5.5";
+const DEFAULT_FALLBACK_THINKING: ThinkingLevel = "high";
 
 // ── Cache helpers ──
 
@@ -75,7 +95,7 @@ function readCache(): QuotaCache {
     const raw = JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
     // 兼容旧格式 { rateLimitExpiresAt: number }
     if (typeof raw.rateLimitExpiresAt === "number") {
-      return { [CLAUDE_PROVIDER]: { rateLimitExpiresAt: raw.rateLimitExpiresAt } };
+      return { [DEFAULT_PRIMARY_PROVIDER]: { rateLimitExpiresAt: raw.rateLimitExpiresAt } };
     }
     return raw as QuotaCache;
   } catch {
@@ -278,6 +298,14 @@ function parseCooldownMs(headers: Record<string, string> | undefined): number {
 // ── Extension ──
 
 export default function (pi: ExtensionAPI) {
+  const cfg = readConfig();
+  const CLAUDE_PROVIDER = cfg.primary?.provider ?? DEFAULT_PRIMARY_PROVIDER;
+  const CLAUDE_MODEL = cfg.primary?.model ?? DEFAULT_PRIMARY_MODEL;
+  const CLAUDE_THINKING = cfg.primary?.thinking ?? DEFAULT_PRIMARY_THINKING;
+  const FALLBACK_PROVIDER = cfg.fallback?.provider ?? DEFAULT_FALLBACK_PROVIDER;
+  const FALLBACK_MODEL = cfg.fallback?.model ?? DEFAULT_FALLBACK_MODEL;
+  const FALLBACK_THINKING = cfg.fallback?.thinking ?? DEFAULT_FALLBACK_THINKING;
+
   let usingClaude = false;
   let lastRequestProvider: string | undefined;
   const rateLimits = new Map<string, RateLimitInfo>(Object.entries(readRateLimits()));
@@ -330,8 +358,8 @@ export default function (pi: ExtensionAPI) {
         const lines: string[] = [];
 
       for (const [provider, label] of [
-        [CLAUDE_PROVIDER, "Claude"],
-        [FALLBACK_PROVIDER, "Codex"],
+        [CLAUDE_PROVIDER, `Primary (${CLAUDE_MODEL})`],
+        [FALLBACK_PROVIDER, `Fallback (${FALLBACK_MODEL})`],
       ] as const) {
         const entry = auth[provider];
         lines.push(`── ${label} (${provider}) ──`);
