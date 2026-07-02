@@ -186,6 +186,9 @@ function parseAnthropicHeaders(headers: Record<string, string>): RateLimitInfo |
       utilization,
       status: headers["anthropic-ratelimit-unified-5h-status"],
       reset: headers["anthropic-ratelimit-unified-5h-reset"],
+      weeklyUtilization: headers["anthropic-ratelimit-unified-7d-utilization"],
+      weeklyStatus: headers["anthropic-ratelimit-unified-7d-status"],
+      weeklyReset: headers["anthropic-ratelimit-unified-7d-reset"],
       capturedAt: Date.now(),
     };
   }
@@ -370,9 +373,17 @@ export default function (pi: ExtensionAPI) {
 
         // Codex 有主动实时 endpoint
         if (codexPrimary) {
+          const codexSecondary = codexUsage?.rate_limit?.secondary_window;
           const pct = Math.round(codexPrimary.used_percent);
           lines.push(`  📈 5h 额度: ${makeBar(pct)} ${pct}%${codexUsage?.plan_type ? ` (${codexUsage.plan_type})` : ""}`);
+          if (codexSecondary) {
+            const wPct = Math.round(codexSecondary.used_percent);
+            lines.push(`  📈 周额度:  ${makeBar(wPct)} ${wPct}%`);
+          }
           lines.push(`  🔄 5h 窗口重置: ${formatReset(codexPrimary.reset_at)}`);
+          if (codexSecondary) {
+            lines.push(`  🔄 周窗口重置: ${formatReset(codexSecondary.reset_at)}`);
+          }
           lines.push(`  ⏱  实时查询`);
           lines.push("");
           continue;
@@ -384,6 +395,10 @@ export default function (pi: ExtensionAPI) {
           if (rl.utilization) {
             const pct = Math.round(Number(rl.utilization) * 100);
             lines.push(`  📈 5h 额度: ${makeBar(pct)} ${pct}%${rl.status ? ` (${rl.status})` : ""}`);
+          }
+          if (rl.weeklyUtilization) {
+            const pct = Math.round(Number(rl.weeklyUtilization) * 100);
+            lines.push(`  📈 周额度:  ${makeBar(pct)} ${pct}%${rl.weeklyStatus ? ` (${rl.weeklyStatus})` : ""}`);
           }
           if (rl.requestsLimit && rl.requestsRemaining) {
             const limit = Number(rl.requestsLimit);
@@ -401,7 +416,11 @@ export default function (pi: ExtensionAPI) {
           }
           if (rl.reset) {
             lines.push(`  🔄 5h 窗口重置: ${formatReset(rl.reset)}`);
-          } else if (rl.tokensReset) {
+          }
+          if (rl.weeklyReset) {
+            lines.push(`  🔄 周窗口重置: ${formatReset(rl.weeklyReset)}`);
+          }
+          if (!rl.reset && !rl.weeklyReset && rl.tokensReset) {
             lines.push(`  🔄 窗口重置: ${rl.tokensReset}`);
           }
           lines.push(`  ⏱  数据时间: ${formatAge(rl.capturedAt ?? Date.now())}`);

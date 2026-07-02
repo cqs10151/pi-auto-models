@@ -2,6 +2,9 @@ export interface RateLimitInfo {
   utilization?: string;
   status?: string;
   reset?: string;
+  weeklyUtilization?: string;
+  weeklyStatus?: string;
+  weeklyReset?: string;
   requestsLimit?: string;
   requestsRemaining?: string;
   requestsReset?: string;
