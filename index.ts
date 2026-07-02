@@ -15,7 +15,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { Container, Text, SelectList, type SelectItem } from "@earendil-works/pi-tui";
+import { Container, Text, SelectList, type SelectItem, matchesKey, Key } from "@earendil-works/pi-tui";
 import { getPassiveRateLimitCooldownMs, type RateLimitInfo } from "./quota-utils.ts";
 
 // ── Types ──
@@ -519,11 +519,19 @@ export default function (pi: ExtensionAPI) {
       });
       if (!slot) return;
 
-      // 选模型
+      // 选模型（支持模糊搜索）
       const model = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+        let filter = "";
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-        container.addChild(new Text(theme.fg("accent", theme.bold(`选择 ${slot === "primary" ? "Primary" : "Fallback"} 模型`)), 1, 0));
+        const titleText = new Text("", 1, 0);
+        const updateTitle = () => {
+          const label = slot === "primary" ? "Primary" : "Fallback";
+          const searchHint = filter ? theme.fg("accent", ` ❯ ${filter}`) : theme.fg("dim", " (输入搜索)");
+          titleText.setText(theme.fg("accent", theme.bold(`选择 ${label} 模型`)) + searchHint);
+        };
+        updateTitle();
+        container.addChild(titleText);
         const list = new SelectList(modelItems, Math.min(modelItems.length, 12), {
           selectedPrefix: (t) => theme.fg("accent", t),
           selectedText: (t) => theme.fg("accent", t),
@@ -534,12 +542,29 @@ export default function (pi: ExtensionAPI) {
         list.onSelect = (item) => done(item.value);
         list.onCancel = () => done(null);
         container.addChild(list);
-        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • enter 确认 • esc 取消"), 1, 0));
+        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • 输入搜索 • enter 确认 • esc 取消"), 1, 0));
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
         return {
           render: (w) => container.render(w),
           invalidate: () => container.invalidate(),
-          handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
+          handleInput: (data) => {
+            if (matchesKey(data, Key.backspace)) {
+              if (filter.length > 0) {
+                filter = filter.slice(0, -1);
+                list.setFilter(filter);
+                updateTitle();
+                container.invalidate();
+              }
+            } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+              filter += data;
+              list.setFilter(filter);
+              updateTitle();
+              container.invalidate();
+            } else {
+              list.handleInput(data);
+            }
+            tui.requestRender();
+          },
         };
       });
       if (!model) return;
