@@ -14,7 +14,8 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { Container, Text, SelectList, type SelectItem } from "@earendil-works/pi-tui";
 import { getPassiveRateLimitCooldownMs, type RateLimitInfo } from "./quota-utils.ts";
 
 // ── Types ──
@@ -69,6 +70,13 @@ function readConfig(): AutoModelConfig {
   } catch {
     return {};
   }
+}
+
+function writeConfig(cfg: AutoModelConfig): void {
+  try {
+    mkdirSync(dirname(CONFIG_FILE), { recursive: true });
+    writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
+  } catch {}
 }
 
 // ── Constants ──
@@ -299,12 +307,12 @@ function parseCooldownMs(headers: Record<string, string> | undefined): number {
 
 export default function (pi: ExtensionAPI) {
   const cfg = readConfig();
-  const CLAUDE_PROVIDER = cfg.primary?.provider ?? DEFAULT_PRIMARY_PROVIDER;
-  const CLAUDE_MODEL = cfg.primary?.model ?? DEFAULT_PRIMARY_MODEL;
-  const CLAUDE_THINKING = cfg.primary?.thinking ?? DEFAULT_PRIMARY_THINKING;
-  const FALLBACK_PROVIDER = cfg.fallback?.provider ?? DEFAULT_FALLBACK_PROVIDER;
-  const FALLBACK_MODEL = cfg.fallback?.model ?? DEFAULT_FALLBACK_MODEL;
-  const FALLBACK_THINKING = cfg.fallback?.thinking ?? DEFAULT_FALLBACK_THINKING;
+  let CLAUDE_PROVIDER = cfg.primary?.provider ?? DEFAULT_PRIMARY_PROVIDER;
+  let CLAUDE_MODEL = cfg.primary?.model ?? DEFAULT_PRIMARY_MODEL;
+  let CLAUDE_THINKING: ThinkingLevel = cfg.primary?.thinking ?? DEFAULT_PRIMARY_THINKING;
+  let FALLBACK_PROVIDER = cfg.fallback?.provider ?? DEFAULT_FALLBACK_PROVIDER;
+  let FALLBACK_MODEL = cfg.fallback?.model ?? DEFAULT_FALLBACK_MODEL;
+  let FALLBACK_THINKING: ThinkingLevel = cfg.fallback?.thinking ?? DEFAULT_FALLBACK_THINKING;
 
   let usingClaude = false;
   let lastRequestProvider: string | undefined;
@@ -465,6 +473,124 @@ export default function (pi: ExtensionAPI) {
         ui.setWorkingMessage(undefined);
         ui.setStatus("auto-model-usage", undefined);
       }
+    },
+  });
+
+  // ── /auto-model 配置命令 ──
+
+  pi.registerCommand("auto-model", {
+    description: "配置默认模型和回退模型",
+    handler: async (_args, ctx) => {
+      const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+      const availableModels = ctx.modelRegistry.getAvailable();
+      const modelItems: SelectItem[] = availableModels.map((m: { provider: string; id: string }) => ({
+        value: `${m.provider}/${m.id}`,
+        label: `${m.provider}/${m.id}`,
+      }));
+
+      // 选 slot
+      const slot = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+        const container = new Container();
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        container.addChild(new Text(theme.fg("accent", theme.bold("配置 Auto Model")), 1, 0));
+        container.addChild(new Text(theme.fg("muted", `Primary: ${CLAUDE_PROVIDER}/${CLAUDE_MODEL} (${CLAUDE_THINKING})`), 1, 0));
+        container.addChild(new Text(theme.fg("muted", `Fallback: ${FALLBACK_PROVIDER}/${FALLBACK_MODEL} (${FALLBACK_THINKING})`), 1, 0));
+        const items: SelectItem[] = [
+          { value: "primary", label: "Primary 模型", description: `${CLAUDE_PROVIDER}/${CLAUDE_MODEL}` },
+          { value: "fallback", label: "Fallback 模型", description: `${FALLBACK_PROVIDER}/${FALLBACK_MODEL}` },
+        ];
+        const list = new SelectList(items, 4, {
+          selectedPrefix: (t) => theme.fg("accent", t),
+          selectedText: (t) => theme.fg("accent", t),
+          description: (t) => theme.fg("muted", t),
+          scrollInfo: (t) => theme.fg("dim", t),
+          noMatch: (t) => theme.fg("warning", t),
+        });
+        list.onSelect = (item) => done(item.value);
+        list.onCancel = () => done(null);
+        container.addChild(list);
+        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • enter 确认 • esc 取消"), 1, 0));
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        return {
+          render: (w) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
+        };
+      });
+      if (!slot) return;
+
+      // 选模型
+      const model = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+        const container = new Container();
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        container.addChild(new Text(theme.fg("accent", theme.bold(`选择 ${slot === "primary" ? "Primary" : "Fallback"} 模型`)), 1, 0));
+        const list = new SelectList(modelItems, Math.min(modelItems.length, 12), {
+          selectedPrefix: (t) => theme.fg("accent", t),
+          selectedText: (t) => theme.fg("accent", t),
+          description: (t) => theme.fg("muted", t),
+          scrollInfo: (t) => theme.fg("dim", t),
+          noMatch: (t) => theme.fg("warning", t),
+        });
+        list.onSelect = (item) => done(item.value);
+        list.onCancel = () => done(null);
+        container.addChild(list);
+        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • enter 确认 • esc 取消"), 1, 0));
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        return {
+          render: (w) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
+        };
+      });
+      if (!model) return;
+
+      // 选 thinking level
+      const thinkingItems: SelectItem[] = THINKING_LEVELS.map((l) => ({ value: l, label: l }));
+      const thinking = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+        const container = new Container();
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        container.addChild(new Text(theme.fg("accent", theme.bold("选择 Thinking Level")), 1, 0));
+        const list = new SelectList(thinkingItems, 6, {
+          selectedPrefix: (t) => theme.fg("accent", t),
+          selectedText: (t) => theme.fg("accent", t),
+          description: (t) => theme.fg("muted", t),
+          scrollInfo: (t) => theme.fg("dim", t),
+          noMatch: (t) => theme.fg("warning", t),
+        });
+        list.onSelect = (item) => done(item.value);
+        list.onCancel = () => done(null);
+        container.addChild(list);
+        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • enter 确认 • esc 取消"), 1, 0));
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        return {
+          render: (w) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
+        };
+      });
+      if (!thinking) return;
+
+      const [provider, ...rest] = model.split("/");
+      const modelId = rest.join("/");
+      const thinkingLevel = thinking as ThinkingLevel;
+
+      // 更新运行时变量
+      if (slot === "primary") {
+        CLAUDE_PROVIDER = provider;
+        CLAUDE_MODEL = modelId;
+        CLAUDE_THINKING = thinkingLevel;
+      } else {
+        FALLBACK_PROVIDER = provider;
+        FALLBACK_MODEL = modelId;
+        FALLBACK_THINKING = thinkingLevel;
+      }
+
+      // 持久化
+      const newCfg = readConfig();
+      newCfg[slot as "primary" | "fallback"] = { provider, model: modelId, thinking: thinkingLevel };
+      writeConfig(newCfg);
+
+      ctx.ui.notify(`${slot === "primary" ? "Primary" : "Fallback"} 已设置为 ${model} (${thinkingLevel})`, "info");
     },
   });
 
