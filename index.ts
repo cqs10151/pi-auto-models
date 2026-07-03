@@ -333,12 +333,18 @@ export default function (pi: ExtensionAPI) {
     const provider = event.message.provider ?? lastRequestProvider ?? ctx.model?.provider;
     if (!provider) return;
 
-    const cooldownMs = parseCooldownMs(undefined);
+    const existing = rateLimits.get(provider);
+    const existingReset = existing?.reset;
+    const existingResetMs = Number(existingReset) * 1000;
+    const hasExistingReset = Number.isFinite(existingResetMs) && existingResetMs > Date.now();
+    const cooldownMs = hasExistingReset ? existingResetMs - Date.now() : parseCooldownMs(undefined);
+
     setProviderRateLimit(provider, Date.now() + cooldownMs);
     rateLimits.set(provider, {
+      ...existing,
       utilization: "1",
       status: "rate_limited",
-      reset: String(Math.ceil((Date.now() + cooldownMs) / 1000)),
+      ...(hasExistingReset ? { reset: existingReset } : {}),
       capturedAt: Date.now(),
     });
     writeRateLimits(rateLimits);

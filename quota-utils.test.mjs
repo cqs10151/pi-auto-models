@@ -50,6 +50,13 @@ test('message_end caches Anthropic 429 errors when headers are unavailable', () 
   assert.match(source, /isProviderRateLimitError/);
 });
 
+test('message_end does not invent a reset time when headers are unavailable', () => {
+  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+
+  assert.match(source, /existingReset/);
+  assert.doesNotMatch(source, /reset: String\(Math\.ceil\(\(Date\.now\(\) \+ cooldownMs\)/);
+});
+
 test('/usage shows visible loading while querying', () => {
   const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
 
