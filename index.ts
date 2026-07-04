@@ -11,173 +11,43 @@
  * /usage command shows each provider's 5h quota usage.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir, DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Text, SelectList, type SelectItem, matchesKey, Key } from "@earendil-works/pi-tui";
-import { getPassiveRateLimitCooldownMs, isProviderRateLimitError, isRateLimitInfoStale, parseCooldownMs, type RateLimitInfo } from "./quota-utils.ts";
-
-// ── Types ──
-
-interface ProviderQuota {
-  rateLimitExpiresAt: number; // ms timestamp
-}
-
-/** Rate-limit cache keyed by provider */
-type QuotaCache = Record<string, ProviderQuota>;
-
-interface AuthEntry {
-  type: string;
-  access: string;
-  refresh: string;
-  expires: number;
-  accountId?: string;
-}
-
-interface CodexWindow {
-  used_percent: number;
-  limit_window_seconds: number;
-  reset_after_seconds: number;
-  reset_at: number;
-}
-
-interface CodexUsage {
-  plan_type?: string;
-  rate_limit?: {
-    allowed: boolean;
-    limit_reached: boolean;
-    primary_window?: CodexWindow;
-    secondary_window?: CodexWindow;
-  };
-}
-
-// ── Config ──
-
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-
-interface AutoModelConfig {
-  primary?: { provider?: string; model?: string; thinking?: ThinkingLevel };
-  fallback?: { provider?: string; model?: string; thinking?: ThinkingLevel };
-}
-
-const CONFIG_FILE = join(getAgentDir(), "auto-model.json");
-
-function readConfig(): AutoModelConfig {
-  try {
-    if (!existsSync(CONFIG_FILE)) return {};
-    return JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as AutoModelConfig;
-  } catch {
-    return {};
-  }
-}
-
-function writeConfig(cfg: AutoModelConfig): void {
-  try {
-    mkdirSync(dirname(CONFIG_FILE), { recursive: true });
-    writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
-  } catch {}
-}
-
-// ── Constants ──
-
-const AUTH_FILE = join(getAgentDir(), "auth.json");
-const CACHE_FILE = join(getAgentDir(), "claude-quota-cache.json");
-const RATE_LIMIT_FILE = join(getAgentDir(), "auto-model-rate-limits.json");
-const DEFAULT_PRIMARY_PROVIDER = "anthropic";
-const DEFAULT_PRIMARY_MODEL = "claude-opus-4-6";
-const DEFAULT_PRIMARY_THINKING: ThinkingLevel = "high";
-
-const DEFAULT_FALLBACK_PROVIDER = "openai-codex";
-const DEFAULT_FALLBACK_MODEL = "gpt-5.5";
-const DEFAULT_FALLBACK_THINKING: ThinkingLevel = "high";
-
-// ── Cache helpers ──
-
-function readCache(): QuotaCache {
-  try {
-    if (!existsSync(CACHE_FILE)) return {};
-    const raw = JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
-    // Backward-compat with legacy format { rateLimitExpiresAt: number }
-    if (typeof raw.rateLimitExpiresAt === "number") {
-      return { [DEFAULT_PRIMARY_PROVIDER]: { rateLimitExpiresAt: raw.rateLimitExpiresAt } };
-    }
-    return raw as QuotaCache;
-  } catch {
-    return {};
-  }
-}
-
-function writeCache(cache: QuotaCache): void {
-  try {
-    mkdirSync(dirname(CACHE_FILE), { recursive: true });
-    writeFileSync(CACHE_FILE, JSON.stringify(cache), "utf-8");
-  } catch {
-    // ponytail: if the write fails, just ignore it
-  }
-}
-
-function setProviderRateLimit(provider: string, expiresAt: number): void {
-  const cache = readCache();
-  cache[provider] = { rateLimitExpiresAt: expiresAt };
-  writeCache(cache);
-}
-
-function getProviderRateLimitLeft(provider: string): number {
-  const cache = readCache();
-  const entry = cache[provider];
-  if (!entry) return 0;
-  return Math.max(0, entry.rateLimitExpiresAt - Date.now());
-}
-
-// ── Auth helpers ──
-
-function readAuth(): Record<string, AuthEntry> {
-  try {
-    if (!existsSync(AUTH_FILE)) return {};
-    return JSON.parse(readFileSync(AUTH_FILE, "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-function readRateLimits(): Record<string, RateLimitInfo> {
-  try {
-    if (!existsSync(RATE_LIMIT_FILE)) return {};
-    return JSON.parse(readFileSync(RATE_LIMIT_FILE, "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-function writeRateLimits(rateLimits: Map<string, RateLimitInfo>): void {
-  try {
-    writeFileSync(RATE_LIMIT_FILE, JSON.stringify(Object.fromEntries(rateLimits), null, 2), "utf-8");
-  } catch {}
-}
-
-function extractCodexAccountId(token: string): string | undefined {
-  try {
-    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf-8"));
-    return payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-  } catch {
-    return undefined;
-  }
-}
-
-async function fetchCodexUsage(entry: AuthEntry): Promise<CodexUsage | null> {
-  const accountId = entry.accountId ?? extractCodexAccountId(entry.access);
-  const res = await fetch("https://chatgpt.com/backend-api/codex/usage", {
-    headers: {
-      authorization: `Bearer ${entry.access}`,
-      ...(accountId ? { "chatgpt-account-id": accountId } : {}),
-      originator: "pi",
-      accept: "application/json",
-    },
-  });
-  if (!res.ok) throw new Error(`Codex usage HTTP ${res.status}`);
-  return (await res.json()) as CodexUsage;
-}
+import {
+  getPassiveRateLimitCooldownMs,
+  isProviderRateLimitError,
+  isRateLimitInfoStale,
+  parseCooldownMs,
+  type RateLimitInfo,
+} from "./quota-utils.ts";
+import {
+  type CodexUsage,
+  type ThinkingLevel,
+  DEFAULT_PRIMARY_PROVIDER,
+  DEFAULT_PRIMARY_MODEL,
+  DEFAULT_PRIMARY_THINKING,
+  DEFAULT_FALLBACK_PROVIDER,
+  DEFAULT_FALLBACK_MODEL,
+  DEFAULT_FALLBACK_THINKING,
+  readConfig,
+  writeConfig,
+  setProviderRateLimit,
+  getProviderRateLimitLeft,
+  readAuth,
+  readRateLimits,
+  writeRateLimits,
+  fetchCodexUsage,
+  parseAnthropicHeaders,
+  parseOpenAIHeaders,
+} from "./quota-data.ts";
+import {
+  formatTimeLeft,
+  formatAge,
+  formatTokens,
+  makeBar,
+  formatReset,
+} from "./format.ts";
 
 // ── Model helpers ──
 
@@ -200,83 +70,6 @@ async function setModelTo(
   }
   pi.setThinkingLevel(thinking);
   return true;
-}
-
-// ── Rate limit header parsers ──
-
-function parseAnthropicHeaders(headers: Record<string, string>): RateLimitInfo | null {
-  const utilization = headers["anthropic-ratelimit-unified-5h-utilization"];
-  if (utilization) {
-    return {
-      utilization,
-      status: headers["anthropic-ratelimit-unified-5h-status"],
-      reset: headers["anthropic-ratelimit-unified-5h-reset"],
-      weeklyUtilization: headers["anthropic-ratelimit-unified-7d-utilization"],
-      weeklyStatus: headers["anthropic-ratelimit-unified-7d-status"],
-      weeklyReset: headers["anthropic-ratelimit-unified-7d-reset"],
-      capturedAt: Date.now(),
-    };
-  }
-
-  const rl = headers["anthropic-ratelimit-requests-limit"];
-  if (!rl) return null;
-  return {
-    requestsLimit: rl,
-    requestsRemaining: headers["anthropic-ratelimit-requests-remaining"],
-    requestsReset: headers["anthropic-ratelimit-requests-reset"],
-    tokensLimit: headers["anthropic-ratelimit-tokens-limit"],
-    tokensRemaining: headers["anthropic-ratelimit-tokens-remaining"],
-    tokensReset: headers["anthropic-ratelimit-tokens-reset"],
-    capturedAt: Date.now(),
-  };
-}
-
-function parseOpenAIHeaders(headers: Record<string, string>): RateLimitInfo | null {
-  const rl = headers["x-ratelimit-limit-requests"];
-  if (!rl) return null;
-  return {
-    requestsLimit: rl,
-    requestsRemaining: headers["x-ratelimit-remaining-requests"],
-    requestsReset: headers["x-ratelimit-reset-requests"],
-    tokensLimit: headers["x-ratelimit-limit-tokens"],
-    tokensRemaining: headers["x-ratelimit-remaining-tokens"],
-    tokensReset: headers["x-ratelimit-reset-tokens"],
-    capturedAt: Date.now(),
-  };
-}
-
-// ── Formatting helpers ──
-
-function formatTimeLeft(ms: number): string {
-  if (ms <= 0) return "expired";
-  const h = Math.floor(ms / 3600000);
-  const m = Math.floor((ms % 3600000) / 60000);
-  if (h > 0) return `${h}h ${m}min`;
-  return `${m}min`;
-}
-
-function formatAge(capturedAt: number): string {
-  const sec = Math.round((Date.now() - capturedAt) / 1000);
-  if (sec < 60) return `${sec}s ago`;
-  return `${Math.round(sec / 60)}min ago`;
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
-  return String(n);
-}
-
-function makeBar(pct: number): string {
-  const safePct = Math.max(0, Math.min(100, pct));
-  const filled = Math.round(safePct / 5);
-  return "[" + "█".repeat(filled) + "░".repeat(20 - filled) + "]";
-}
-
-function formatReset(reset: string | number): string {
-  const seconds = Number(reset);
-  if (Number.isFinite(seconds)) return new Date(seconds * 1000).toLocaleString();
-  return String(reset);
 }
 
 // ── Extension ──
