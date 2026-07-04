@@ -13,13 +13,19 @@ A [pi](https://pi.dev) extension that automatically switches between a **primary
 ## Install
 
 ```bash
+pi install npm:pi-auto-models
+```
+
+Or install from git:
+
+```bash
 pi install git:github.com/Fatpandac/pi-auto-models
 ```
 
 Try it for one run without installing:
 
 ```bash
-pi -e git:github.com/Fatpandac/pi-auto-models
+pi -e npm:pi-auto-models
 ```
 
 ## Commands
