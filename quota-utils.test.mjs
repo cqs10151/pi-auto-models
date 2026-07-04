@@ -28,8 +28,8 @@ test('/usage hides stale passive Claude quota snapshots', () => {
   const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
 
   assert.match(source, /isRateLimitInfoStale/);
-  assert.match(source, /额度未知/);
-  assert.match(source, /旧数据已过期/);
+  assert.match(source, /Quota unknown/);
+  assert.match(source, /Stale data/);
 });
 
 test('falls back when 429 reset header is already stale', () => {
@@ -62,7 +62,7 @@ test('/usage shows visible loading while querying', () => {
 
   assert.match(source, /pi\.registerCommand\("usage"/);
   assert.doesNotMatch(source, /pi\.registerCommand\("quota"/);
-  assert.match(source, /ui\.setStatus\("auto-model-usage", .*查询额度中/);
+  assert.match(source, /ui\.setStatus\("auto-model-usage", .*Checking quota/);
   assert.match(source, /finally \{[\s\S]*ui\.setStatus\("auto-model-usage", undefined\);/);
   assert.match(source, /ui\.setWorkingVisible\(true\);[\s\S]*finally \{[\s\S]*ui\.setWorkingVisible\(true\);/);
   assert.doesNotMatch(source, /ui\.setWorkingVisible\(false\);/);

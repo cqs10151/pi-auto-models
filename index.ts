@@ -1,14 +1,14 @@
 /**
  * Auto Model Switch Extension
  *
- * 每次 session 开始时判断 Claude 是否有额度：
- * - 有额度 → claude-opus-4-6 + high thinking
- * - 没额度 → gpt-5.5 + high thinking
+ * On each session start, check whether Claude still has quota:
+ * - has quota   → claude-opus-4-6 + high thinking
+ * - no quota    → gpt-5.5 + high thinking
  *
- * 通过缓存限额过期时间避免重复检查。
- * 通过 after_provider_response 检测 429 自动切换并缓存。
+ * Caches the rate-limit expiry time to avoid repeated checks.
+ * Detects 429 in after_provider_response to auto-switch and cache.
  *
- * /usage 命令查看各 provider 的 5h 额度使用情况。
+ * /usage command shows each provider's 5h quota usage.
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -24,7 +24,7 @@ interface ProviderQuota {
   rateLimitExpiresAt: number; // ms timestamp
 }
 
-/** 按 provider 存储限额缓存 */
+/** Rate-limit cache keyed by provider */
 type QuotaCache = Record<string, ProviderQuota>;
 
 interface AuthEntry {
@@ -98,7 +98,7 @@ function readCache(): QuotaCache {
   try {
     if (!existsSync(CACHE_FILE)) return {};
     const raw = JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
-    // 兼容旧格式 { rateLimitExpiresAt: number }
+    // Backward-compat with legacy format { rateLimitExpiresAt: number }
     if (typeof raw.rateLimitExpiresAt === "number") {
       return { [DEFAULT_PRIMARY_PROVIDER]: { rateLimitExpiresAt: raw.rateLimitExpiresAt } };
     }
@@ -113,7 +113,7 @@ function writeCache(cache: QuotaCache): void {
     mkdirSync(dirname(CACHE_FILE), { recursive: true });
     writeFileSync(CACHE_FILE, JSON.stringify(cache), "utf-8");
   } catch {
-    // ponytail: 写不了就算了
+    // ponytail: if the write fails, just ignore it
   }
 }
 
@@ -190,12 +190,12 @@ async function setModelTo(
 ): Promise<boolean> {
   const model = ctx.modelRegistry.find(provider, modelId);
   if (!model) {
-    ctx.ui.notify(`模型 ${provider}/${modelId} 未找到`, "warning");
+    ctx.ui.notify(`Model ${provider}/${modelId} not found`, "warning");
     return false;
   }
   const ok = await pi.setModel(model);
   if (!ok) {
-    ctx.ui.notify(`模型 ${provider}/${modelId} 无可用 API Key`, "warning");
+    ctx.ui.notify(`No available API key for ${provider}/${modelId}`, "warning");
     return false;
   }
   pi.setThinkingLevel(thinking);
@@ -248,7 +248,7 @@ function parseOpenAIHeaders(headers: Record<string, string>): RateLimitInfo | nu
 // ── Formatting helpers ──
 
 function formatTimeLeft(ms: number): string {
-  if (ms <= 0) return "已过期";
+  if (ms <= 0) return "expired";
   const h = Math.floor(ms / 3600000);
   const m = Math.floor((ms % 3600000) / 60000);
   if (h > 0) return `${h}h ${m}min`;
@@ -257,8 +257,8 @@ function formatTimeLeft(ms: number): string {
 
 function formatAge(capturedAt: number): string {
   const sec = Math.round((Date.now() - capturedAt) / 1000);
-  if (sec < 60) return `${sec}s 前`;
-  return `${Math.round(sec / 60)}min 前`;
+  if (sec < 60) return `${sec}s ago`;
+  return `${Math.round(sec / 60)}min ago`;
 }
 
 function formatTokens(n: number): string {
@@ -310,7 +310,7 @@ export default function (pi: ExtensionAPI) {
       if (ok) {
         usingClaude = false;
         ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
-        ctx.ui.notify(`Claude 限额中，使用 ${FALLBACK_MODEL}`, "info");
+        ctx.ui.notify(`Claude rate-limited, using ${FALLBACK_MODEL}`, "info");
       }
     } else {
       const ok = await setModelTo(pi, ctx, CLAUDE_PROVIDER, CLAUDE_MODEL, CLAUDE_THINKING);
@@ -354,21 +354,21 @@ export default function (pi: ExtensionAPI) {
       if (ok) {
         usingClaude = false;
         ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
-        ctx.ui.notify(`Claude 限额，已切换到 ${FALLBACK_MODEL}`, "warning");
+        ctx.ui.notify(`Claude rate-limited, switched to ${FALLBACK_MODEL}`, "warning");
       }
     }
   });
 
-  // ── /usage 命令 ──
+  // ── /usage command ──
 
   pi.registerCommand("usage", {
-    description: "显示 Claude / Codex 5h 额度使用情况",
+    description: "Show Claude / Codex 5h quota usage",
     handler: async (_args, ctx) => {
-      // ponytail: 跨 await 不再读 ctx，避免 reload 后 stale；只捕获 UI 对象
+      // ponytail: don't read ctx across await (stale after reload); capture UI only
       const ui = ctx.ui;
-      ui.setWorkingMessage("查询额度中…");
+      ui.setWorkingMessage("Checking quota…");
       ui.setWorkingVisible(true);
-      ui.setStatus("auto-model-usage", ui.theme.fg("warning", "⏳ 查询额度中…"));
+      ui.setStatus("auto-model-usage", ui.theme.fg("warning", "⏳ Checking quota…"));
       try {
         const auth = readAuth();
         const lines: string[] = [];
@@ -380,13 +380,13 @@ export default function (pi: ExtensionAPI) {
         const entry = auth[provider];
         lines.push(`── ${label} (${provider}) ──`);
 
-        // 登录状态
+        // Login status
         if (!entry) {
-          lines.push("  🔑 未登录");
+          lines.push("  🔑 Not logged in");
         } else if (Date.now() > entry.expires) {
-          lines.push("  🔑 Token 已过期，请重新 /login");
+          lines.push("  🔑 Token expired, please /login again");
         } else {
-          lines.push(`  🔑 已登录 (token 有效至 ${new Date(entry.expires).toLocaleDateString()})`);
+          lines.push(`  🔑 Logged in (token valid until ${new Date(entry.expires).toLocaleDateString()})`);
         }
 
         let codexUsage: CodexUsage | null = null;
@@ -400,54 +400,54 @@ export default function (pi: ExtensionAPI) {
         }
         const codexPrimary = codexUsage?.rate_limit?.primary_window;
 
-        // 限额状态（两个 provider 都支持）
+        // Rate-limit status (supported for both providers)
         const passiveLeft = getPassiveRateLimitCooldownMs(rateLimits.get(provider));
         if (passiveLeft > 0) setProviderRateLimit(provider, Date.now() + passiveLeft);
         const left = Math.max(getProviderRateLimitLeft(provider), passiveLeft);
         const rl = rateLimits.get(provider);
         const stale = isRateLimitInfoStale(rl);
         if (codexUsage?.rate_limit?.limit_reached && codexPrimary) {
-          lines.push(`  📊 ❌ 限额中，${formatTimeLeft(codexPrimary.reset_after_seconds * 1000)} 后恢复`);
+          lines.push(`  📊 ❌ Rate-limited, recovers in ${formatTimeLeft(codexPrimary.reset_after_seconds * 1000)}`);
           setProviderRateLimit(provider, codexPrimary.reset_at * 1000);
         } else if (codexUsage?.rate_limit?.allowed) {
-          lines.push("  📊 ✅ 额度可用");
+          lines.push("  📊 ✅ Quota available");
         } else if (left > 0) {
-          lines.push(`  📊 ❌ 限额中，${formatTimeLeft(left)} 后恢复`);
+          lines.push(`  📊 ❌ Rate-limited, recovers in ${formatTimeLeft(left)}`);
         } else if (stale || (provider === CLAUDE_PROVIDER && !rl)) {
-          lines.push("  📊 额度未知");
+          lines.push("  📊 Quota unknown");
         } else {
-          lines.push("  📊 ✅ 额度可用");
+          lines.push("  📊 ✅ Quota available");
         }
 
-        // Codex 有主动实时 endpoint
+        // Codex has a live usage endpoint
         if (codexPrimary) {
           const codexSecondary = codexUsage?.rate_limit?.secondary_window;
           const pct = Math.round(codexPrimary.used_percent);
-          lines.push(`  📈 5h 额度: ${makeBar(pct)} ${pct}%${codexUsage?.plan_type ? ` (${codexUsage.plan_type})` : ""}`);
+          lines.push(`  📈 5h quota: ${makeBar(pct)} ${pct}%${codexUsage?.plan_type ? ` (${codexUsage.plan_type})` : ""}`);
           if (codexSecondary) {
             const wPct = Math.round(codexSecondary.used_percent);
-            lines.push(`  📈 周额度:  ${makeBar(wPct)} ${wPct}%`);
+            lines.push(`  📈 Weekly quota:  ${makeBar(wPct)} ${wPct}%`);
           }
-          lines.push(`  🔄 5h 窗口重置: ${formatReset(codexPrimary.reset_at)}`);
+          lines.push(`  🔄 5h window reset: ${formatReset(codexPrimary.reset_at)}`);
           if (codexSecondary) {
-            lines.push(`  🔄 周窗口重置: ${formatReset(codexSecondary.reset_at)}`);
+            lines.push(`  🔄 Weekly window reset: ${formatReset(codexSecondary.reset_at)}`);
           }
-          lines.push(`  ⏰ 实时查询`);
+          lines.push(`  ⏰ Real-time`);
           lines.push("");
           continue;
         }
 
-        // Claude 从响应 headers 被动捕获
+        // Claude is captured passively from response headers
         if (stale) {
-          lines.push("  📈 旧数据已过期，使用后自动获取额度详情");
+          lines.push("  📈 Stale data, quota details fetched automatically after use");
         } else if (rl) {
           if (rl.utilization) {
             const pct = Math.round(Number(rl.utilization) * 100);
-            lines.push(`  📈 5h 额度: ${makeBar(pct)} ${pct}%${rl.status ? ` (${rl.status})` : ""}`);
+            lines.push(`  📈 5h quota: ${makeBar(pct)} ${pct}%${rl.status ? ` (${rl.status})` : ""}`);
           }
           if (rl.weeklyUtilization) {
             const pct = Math.round(Number(rl.weeklyUtilization) * 100);
-            lines.push(`  📈 周额度:  ${makeBar(pct)} ${pct}%${rl.weeklyStatus ? ` (${rl.weeklyStatus})` : ""}`);
+            lines.push(`  📈 Weekly quota:  ${makeBar(pct)} ${pct}%${rl.weeklyStatus ? ` (${rl.weeklyStatus})` : ""}`);
           }
           if (rl.requestsLimit && rl.requestsRemaining) {
             const limit = Number(rl.requestsLimit);
@@ -464,17 +464,17 @@ export default function (pi: ExtensionAPI) {
             lines.push(`  📈 Tokens:   ${formatTokens(used)}/${formatTokens(limit)} ${makeBar(pct)} ${pct}%`);
           }
           if (rl.reset) {
-            lines.push(`  🔄 5h 窗口重置: ${formatReset(rl.reset)}`);
+            lines.push(`  🔄 5h window reset: ${formatReset(rl.reset)}`);
           }
           if (rl.weeklyReset) {
-            lines.push(`  🔄 周窗口重置: ${formatReset(rl.weeklyReset)}`);
+            lines.push(`  🔄 Weekly window reset: ${formatReset(rl.weeklyReset)}`);
           }
           if (!rl.reset && !rl.weeklyReset && rl.tokensReset) {
-            lines.push(`  🔄 窗口重置: ${rl.tokensReset}`);
+            lines.push(`  🔄 Window reset: ${rl.tokensReset}`);
           }
-          lines.push(`  ⏰ 数据时间: ${formatAge(rl.capturedAt ?? Date.now())}`);
+          lines.push(`  ⏰ Data age: ${formatAge(rl.capturedAt ?? Date.now())}`);
         } else {
-          lines.push(codexUsageError ? `  📈 获取额度失败: ${codexUsageError}` : "  📈 使用后自动获取额度详情");
+          lines.push(codexUsageError ? `  📈 Failed to fetch quota: ${codexUsageError}` : "  📈 Quota details fetched automatically after use");
         }
 
         lines.push("");
@@ -489,10 +489,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── /auto-model 配置命令 ──
+  // ── /auto-model config command ──
 
   pi.registerCommand("auto-model", {
-    description: "配置默认模型和回退模型",
+    description: "Configure primary and fallback models",
     handler: async (_args, ctx) => {
       const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
       const availableModels = ctx.modelRegistry.getAvailable();
@@ -501,16 +501,16 @@ export default function (pi: ExtensionAPI) {
         label: `${m.provider}/${m.id}`,
       }));
 
-      // 选 slot
+      // Pick slot
       const slot = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-        container.addChild(new Text(theme.fg("accent", theme.bold("配置 Auto Model")), 1, 0));
+        container.addChild(new Text(theme.fg("accent", theme.bold("Configure Auto Model")), 1, 0));
         container.addChild(new Text(theme.fg("muted", `Primary: ${CLAUDE_PROVIDER}/${CLAUDE_MODEL} (${CLAUDE_THINKING})`), 1, 0));
         container.addChild(new Text(theme.fg("muted", `Fallback: ${FALLBACK_PROVIDER}/${FALLBACK_MODEL} (${FALLBACK_THINKING})`), 1, 0));
         const items: SelectItem[] = [
-          { value: "primary", label: "Primary 模型", description: `${CLAUDE_PROVIDER}/${CLAUDE_MODEL}` },
-          { value: "fallback", label: "Fallback 模型", description: `${FALLBACK_PROVIDER}/${FALLBACK_MODEL}` },
+          { value: "primary", label: "Primary model", description: `${CLAUDE_PROVIDER}/${CLAUDE_MODEL}` },
+          { value: "fallback", label: "Fallback model", description: `${FALLBACK_PROVIDER}/${FALLBACK_MODEL}` },
         ];
         const list = new SelectList(items, 4, {
           selectedPrefix: (t) => theme.fg("accent", t),
@@ -522,7 +522,7 @@ export default function (pi: ExtensionAPI) {
         list.onSelect = (item) => done(item.value);
         list.onCancel = () => done(null);
         container.addChild(list);
-        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • enter 确认 • esc 取消"), 1, 0));
+        container.addChild(new Text(theme.fg("dim", "↑↓ select • enter confirm • esc cancel"), 1, 0));
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
         return {
           render: (w) => container.render(w),
@@ -532,11 +532,11 @@ export default function (pi: ExtensionAPI) {
       });
       if (!slot) return;
 
-      // 选模型（fzf 模糊搜索）
+      // Pick model (fzf fuzzy search)
       const model = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         let filter = "";
 
-        // ponytail: fzf-style 模糊匹配，按字符顺序匹配，不要求连续
+        // ponytail: fzf-style fuzzy match; chars in order, not required contiguous
         const fzfMatch = (text: string, pattern: string): number => {
           if (!pattern) return 1;
           const lower = text.toLowerCase();
@@ -552,7 +552,7 @@ export default function (pi: ExtensionAPI) {
           const filtered = filter
             ? modelItems.filter((item) => fzfMatch(item.label, filter))
             : modelItems;
-          // 重建 SelectList
+          // Rebuild SelectList
           container.removeChild(list);
           container.removeChild(helpText);
           container.removeChild(bottomBorder);
@@ -570,8 +570,8 @@ export default function (pi: ExtensionAPI) {
         const titleText = new Text("", 1, 0);
         const updateTitle = () => {
           const label = slot === "primary" ? "Primary" : "Fallback";
-          const searchHint = filter ? theme.fg("accent", ` ❯ ${filter}`) : theme.fg("dim", " (输入搜索)");
-          titleText.setText(theme.fg("accent", theme.bold(`选择 ${label} 模型`)) + searchHint);
+          const searchHint = filter ? theme.fg("accent", ` ❯ ${filter}`) : theme.fg("dim", " (type to search)");
+          titleText.setText(theme.fg("accent", theme.bold(`Select ${label} model`)) + searchHint);
         };
         updateTitle();
         container.addChild(titleText);
@@ -586,7 +586,7 @@ export default function (pi: ExtensionAPI) {
         list.onSelect = (item) => done(item.value);
         list.onCancel = () => done(null);
         container.addChild(list);
-        const helpText = new Text(theme.fg("dim", "↑↓ 选择 • 输入搜索 • enter 确认 • esc 取消"), 1, 0);
+        const helpText = new Text(theme.fg("dim", "↑↓ select • type to search • enter confirm • esc cancel"), 1, 0);
         container.addChild(helpText);
         const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
         container.addChild(bottomBorder);
@@ -613,12 +613,12 @@ export default function (pi: ExtensionAPI) {
       });
       if (!model) return;
 
-      // 选 thinking level
+      // Pick thinking level
       const thinkingItems: SelectItem[] = THINKING_LEVELS.map((l) => ({ value: l, label: l }));
       const thinking = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-        container.addChild(new Text(theme.fg("accent", theme.bold("选择 Thinking Level")), 1, 0));
+        container.addChild(new Text(theme.fg("accent", theme.bold("Select Thinking Level")), 1, 0));
         const list = new SelectList(thinkingItems, 6, {
           selectedPrefix: (t) => theme.fg("accent", t),
           selectedText: (t) => theme.fg("accent", t),
@@ -629,7 +629,7 @@ export default function (pi: ExtensionAPI) {
         list.onSelect = (item) => done(item.value);
         list.onCancel = () => done(null);
         container.addChild(list);
-        container.addChild(new Text(theme.fg("dim", "↑↓ 选择 • enter 确认 • esc 取消"), 1, 0));
+        container.addChild(new Text(theme.fg("dim", "↑↓ select • enter confirm • esc cancel"), 1, 0));
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
         return {
           render: (w) => container.render(w),
@@ -643,7 +643,7 @@ export default function (pi: ExtensionAPI) {
       const modelId = rest.join("/");
       const thinkingLevel = thinking as ThinkingLevel;
 
-      // 更新运行时变量
+      // Update runtime variables
       if (slot === "primary") {
         CLAUDE_PROVIDER = provider;
         CLAUDE_MODEL = modelId;
@@ -654,22 +654,22 @@ export default function (pi: ExtensionAPI) {
         FALLBACK_THINKING = thinkingLevel;
       }
 
-      // 持久化
+      // Persist
       const newCfg = readConfig();
       newCfg[slot as "primary" | "fallback"] = { provider, model: modelId, thinking: thinkingLevel };
       writeConfig(newCfg);
 
-      ctx.ui.notify(`${slot === "primary" ? "Primary" : "Fallback"} 已设置为 ${model} (${thinkingLevel})`, "info");
+      ctx.ui.notify(`${slot === "primary" ? "Primary" : "Fallback"} set to ${model} (${thinkingLevel})`, "info");
     },
   });
 
-  // ── 响应拦截 ──
+  // ── Response interception ──
 
   pi.on("after_provider_response", async (event, ctx) => {
     const headers = event.headers;
     const provider = lastRequestProvider ?? ctx.model?.provider;
 
-    // 被动捕获 rate limit headers（Claude 有，Codex 没有）
+    // Passively capture rate limit headers (Claude has them, Codex doesn't)
     if (headers && provider) {
       const info = parseAnthropicHeaders(headers) ?? parseOpenAIHeaders(headers);
       if (info) {
@@ -680,7 +680,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // 429/529 → 记录限额并切换模型
+    // 429/529 → record rate limit and switch model
     if (event.status === 429 || event.status === 529) {
       const cooldownMs = parseCooldownMs(headers);
 
@@ -688,14 +688,14 @@ export default function (pi: ExtensionAPI) {
         setProviderRateLimit(provider, Date.now() + cooldownMs);
       }
 
-      // 如果当前是 Claude 被限额，切到 Codex
+      // If Claude is currently rate-limited, switch to Codex
       if (usingClaude && (provider === CLAUDE_PROVIDER || !provider)) {
         const ok = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);
         if (ok) {
           usingClaude = false;
           const minutes = Math.round(cooldownMs / 60000);
           ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
-          ctx.ui.notify(`Claude 限额，已切换到 ${FALLBACK_MODEL}，${minutes}min 后重试`, "warning");
+          ctx.ui.notify(`Claude rate-limited, switched to ${FALLBACK_MODEL}, retry in ${minutes}min`, "warning");
         }
       }
     }
