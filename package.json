@@ -2,7 +2,10 @@
   "name": "pi-auto-models",
   "version": "0.1.1",
   "description": "Auto-switch pi between a primary and fallback model based on quota, with /usage and /auto-model commands.",
-  "repository": "github.com/Fatpandac/pi-auto-models",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fatpandac/pi-auto-models.git"
+  },
   "license": "MIT",
   "keywords": [
     "pi-package"
