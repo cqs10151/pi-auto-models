@@ -5,6 +5,7 @@
   "repository": "github.com/Fatpandac/pi-auto-models",
   "license": "MIT",
   "keywords": ["pi-package"],
+  "files": ["index.ts", "quota-data.ts", "format.ts", "quota-utils.ts", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./index.ts"]
   },
