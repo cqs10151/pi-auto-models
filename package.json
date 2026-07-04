@@ -1,6 +1,6 @@
 {
   "name": "pi-auto-models",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Auto-switch pi between a primary and fallback model based on quota, with /usage and /auto-model commands.",
   "repository": {
     "type": "git",
