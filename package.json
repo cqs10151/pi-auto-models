@@ -7,6 +7,9 @@
     "url": "git+https://github.com/Fatpandac/pi-auto-models.git"
   },
   "license": "MIT",
+  "scripts": {
+    "publish": "npm version patch && git push --follow-tags origin main"
+  },
   "keywords": [
     "pi-package"
   ],
