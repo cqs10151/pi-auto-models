@@ -28,6 +28,16 @@ export function makeBar(pct: number): string {
   return "[" + "█".repeat(filled) + "░".repeat(20 - filled) + "]";
 }
 
+/** Label a Codex quota window by its actual duration (OpenAI may drop/rename windows). */
+export function formatWindowLabel(limitWindowSeconds: number): string {
+  const hours = limitWindowSeconds / 3600;
+  if (hours >= 24) {
+    const days = Math.round(hours / 24);
+    return days === 7 ? "Weekly" : `${days}d`;
+  }
+  return `${Math.round(hours)}h`;
+}
+
 export function formatReset(reset: string | number): string {
   const seconds = Number(reset);
   if (Number.isFinite(seconds)) return new Date(seconds * 1000).toLocaleString();

@@ -73,3 +73,16 @@ test('session start unhides the built-in working loader after reload', () => {
 
   assert.match(source, /pi\.on\("session_start", async \(_event, ctx\) => \{\n\s+ctx\.ui\.setWorkingVisible\(true\);/);
 });
+
+test('formatWindowLabel labels windows by real duration, not position', async () => {
+  const { formatWindowLabel } = await import('./format.ts');
+  assert.equal(formatWindowLabel(5 * 3600), '5h');
+  assert.equal(formatWindowLabel(7 * 24 * 3600), 'Weekly');
+  assert.equal(formatWindowLabel(30 * 24 * 3600), '30d');
+});
+
+test('/usage renders whatever Codex windows exist even without a 5h window', () => {
+  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+  assert.match(source, /codexWindows/);
+  assert.doesNotMatch(source, /codexPrimary/);
+});

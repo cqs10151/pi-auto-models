@@ -23,6 +23,7 @@ import {
 } from "./quota-utils.ts";
 import {
   type CodexUsage,
+  type CodexWindow,
   type ThinkingLevel,
   DEFAULT_PRIMARY_PROVIDER,
   DEFAULT_PRIMARY_MODEL,
@@ -47,6 +48,7 @@ import {
   formatTokens,
   makeBar,
   formatReset,
+  formatWindowLabel,
 } from "./format.ts";
 
 // ── Model helpers ──
@@ -155,7 +157,7 @@ export default function (pi: ExtensionAPI) {
   // ── /usage command ──
 
   pi.registerCommand("usage", {
-    description: "Show Claude / Codex 5h quota usage",
+    description: "Show Claude / Codex quota usage",
     handler: async (_args, ctx) => {
       // ponytail: don't read ctx across await (stale after reload); capture UI only
       const ui = ctx.ui;
@@ -191,7 +193,16 @@ export default function (pi: ExtensionAPI) {
             codexUsageError = error instanceof Error ? error.message : String(error);
           }
         }
-        const codexPrimary = codexUsage?.rate_limit?.primary_window;
+        // Whatever windows OpenAI returns (5h may be gone), labelled by real duration.
+        const codexWindows = [
+          codexUsage?.rate_limit?.primary_window,
+          codexUsage?.rate_limit?.secondary_window,
+        ].filter((w): w is CodexWindow => !!w);
+        // Most conservative recovery: the window that resets furthest out.
+        const codexGoverning = codexWindows.reduce<CodexWindow | undefined>(
+          (max, w) => (!max || w.reset_at > max.reset_at ? w : max),
+          undefined,
+        );
 
         // Rate-limit status (supported for both providers)
         const passiveLeft = getPassiveRateLimitCooldownMs(rateLimits.get(provider));
@@ -199,9 +210,9 @@ export default function (pi: ExtensionAPI) {
         const left = Math.max(getProviderRateLimitLeft(provider), passiveLeft);
         const rl = rateLimits.get(provider);
         const stale = isRateLimitInfoStale(rl);
-        if (codexUsage?.rate_limit?.limit_reached && codexPrimary) {
-          lines.push(`  📊 ❌ Rate-limited, recovers in ${formatTimeLeft(codexPrimary.reset_after_seconds * 1000)}`);
-          setProviderRateLimit(provider, codexPrimary.reset_at * 1000);
+        if (codexUsage?.rate_limit?.limit_reached && codexGoverning) {
+          lines.push(`  📊 ❌ Rate-limited, recovers in ${formatTimeLeft(codexGoverning.reset_after_seconds * 1000)}`);
+          setProviderRateLimit(provider, codexGoverning.reset_at * 1000);
         } else if (codexUsage?.rate_limit?.allowed) {
           lines.push("  📊 ✅ Quota available");
         } else if (left > 0) {
@@ -213,17 +224,14 @@ export default function (pi: ExtensionAPI) {
         }
 
         // Codex has a live usage endpoint
-        if (codexPrimary) {
-          const codexSecondary = codexUsage?.rate_limit?.secondary_window;
-          const pct = Math.round(codexPrimary.used_percent);
-          lines.push(`  📈 5h quota: ${makeBar(pct)} ${pct}%${codexUsage?.plan_type ? ` (${codexUsage.plan_type})` : ""}`);
-          if (codexSecondary) {
-            const wPct = Math.round(codexSecondary.used_percent);
-            lines.push(`  📈 Weekly quota:  ${makeBar(wPct)} ${wPct}%`);
-          }
-          lines.push(`  🔄 5h window reset: ${formatReset(codexPrimary.reset_at)}`);
-          if (codexSecondary) {
-            lines.push(`  🔄 Weekly window reset: ${formatReset(codexSecondary.reset_at)}`);
+        if (codexWindows.length > 0) {
+          codexWindows.forEach((w, i) => {
+            const pct = Math.round(w.used_percent);
+            const plan = i === 0 && codexUsage?.plan_type ? ` (${codexUsage.plan_type})` : "";
+            lines.push(`  📈 ${formatWindowLabel(w.limit_window_seconds)} quota: ${makeBar(pct)} ${pct}%${plan}`);
+          });
+          for (const w of codexWindows) {
+            lines.push(`  🔄 ${formatWindowLabel(w.limit_window_seconds)} window reset: ${formatReset(w.reset_at)}`);
           }
           lines.push(`  ⏰ Real-time`);
           lines.push("");
