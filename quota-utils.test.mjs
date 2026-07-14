@@ -86,3 +86,21 @@ test('/usage renders whatever Codex windows exist even without a 5h window', () 
   assert.match(source, /codexWindows/);
   assert.doesNotMatch(source, /codexPrimary/);
 });
+
+test('Codex usage shows no 5h activity and labels long-reset window as weekly', async () => {
+  const format = await import('./format.ts');
+  const lines = format.formatCodexUsageLines?.([
+    {
+      used_percent: 13,
+      limit_window_seconds: 5 * 3600,
+      reset_after_seconds: 6 * 24 * 3600,
+      reset_at: 1784523154,
+    },
+  ], 'pro');
+
+  assert.deepEqual(lines?.slice(0, 2), [
+    '  📈 5h quota: No 5h activity',
+    '  📈 Weekly quota: [███░░░░░░░░░░░░░░░░░] 13% (pro)',
+  ]);
+  assert.match(lines?.[2] ?? '', /^  🔄 Weekly window reset: /);
+});

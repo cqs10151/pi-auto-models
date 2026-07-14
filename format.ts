@@ -43,3 +43,32 @@ export function formatReset(reset: string | number): string {
   if (Number.isFinite(seconds)) return new Date(seconds * 1000).toLocaleString();
   return String(reset);
 }
+
+interface CodexWindowLike {
+  used_percent: number;
+  limit_window_seconds: number;
+  reset_after_seconds: number;
+  reset_at: number;
+}
+
+function formatCodexWindowLabel(w: CodexWindowLike): string {
+  // Codex may report the old 5h duration even when only the weekly window is active.
+  return w.reset_after_seconds > 24 * 3600 ? "Weekly" : formatWindowLabel(w.limit_window_seconds);
+}
+
+export function formatCodexUsageLines(windows: CodexWindowLike[], planType?: string): string[] {
+  const labeled = windows.map((w) => ({ w, label: formatCodexWindowLabel(w) }));
+  const lines: string[] = [];
+  if (labeled.length > 0 && !labeled.some(({ label }) => label === "5h")) {
+    lines.push("  📈 5h quota: No 5h activity");
+  }
+  labeled.forEach(({ w, label }, i) => {
+    const pct = Math.round(w.used_percent);
+    const plan = i === 0 && planType ? ` (${planType})` : "";
+    lines.push(`  📈 ${label} quota: ${makeBar(pct)} ${pct}%${plan}`);
+  });
+  for (const { w, label } of labeled) {
+    lines.push(`  🔄 ${label} window reset: ${formatReset(w.reset_at)}`);
+  }
+  return lines;
+}

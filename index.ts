@@ -48,7 +48,7 @@ import {
   formatTokens,
   makeBar,
   formatReset,
-  formatWindowLabel,
+  formatCodexUsageLines,
 } from "./format.ts";
 
 // ── Model helpers ──
@@ -225,14 +225,7 @@ export default function (pi: ExtensionAPI) {
 
         // Codex has a live usage endpoint
         if (codexWindows.length > 0) {
-          codexWindows.forEach((w, i) => {
-            const pct = Math.round(w.used_percent);
-            const plan = i === 0 && codexUsage?.plan_type ? ` (${codexUsage.plan_type})` : "";
-            lines.push(`  📈 ${formatWindowLabel(w.limit_window_seconds)} quota: ${makeBar(pct)} ${pct}%${plan}`);
-          });
-          for (const w of codexWindows) {
-            lines.push(`  🔄 ${formatWindowLabel(w.limit_window_seconds)} window reset: ${formatReset(w.reset_at)}`);
-          }
+          lines.push(...formatCodexUsageLines(codexWindows, codexUsage?.plan_type));
           lines.push(`  ⏰ Real-time`);
           lines.push("");
           continue;
