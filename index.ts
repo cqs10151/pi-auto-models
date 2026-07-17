@@ -168,12 +168,9 @@ export default function (pi: ExtensionAPI) {
         const auth = readAuth();
         const lines: string[] = [];
 
-      for (const [provider, label] of [
-        [CLAUDE_PROVIDER, `Primary (${CLAUDE_MODEL})`],
-        [FALLBACK_PROVIDER, `Fallback (${FALLBACK_MODEL})`],
-      ] as const) {
+      for (const provider of new Set([CLAUDE_PROVIDER, FALLBACK_PROVIDER])) {
         const entry = auth[provider];
-        lines.push(`── ${label} (${provider}) ──`);
+        lines.push(`── Account (${provider}) ──`);
 
         // Login status
         if (!entry) {

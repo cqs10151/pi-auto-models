@@ -81,6 +81,13 @@ test('formatWindowLabel labels windows by real duration, not position', async ()
   assert.equal(formatWindowLabel(30 * 24 * 3600), '30d');
 });
 
+test('/usage renders each provider account once', () => {
+  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+
+  assert.match(source, /new Set\(\[CLAUDE_PROVIDER, FALLBACK_PROVIDER\]\)/);
+  assert.match(source, /lines\.push\(`── Account \(\$\{provider\}\) ──`\)/);
+});
+
 test('/usage renders whatever Codex windows exist even without a 5h window', () => {
   const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
   assert.match(source, /codexWindows/);
