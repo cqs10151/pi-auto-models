@@ -39,16 +39,17 @@ import {
   readRateLimits,
   writeRateLimits,
   fetchCodexUsage,
+  fetchClaudeUsage,
+  type ClaudeUsage,
   parseAnthropicHeaders,
   parseOpenAIHeaders,
 } from "./quota-data.ts";
 import {
   formatTimeLeft,
   formatAge,
-  formatTokens,
-  makeBar,
-  formatReset,
   formatCodexUsageLines,
+  formatClaudeUsageLines,
+  formatPassiveRateLimitLines,
 } from "./format.ts";
 
 // ── Model helpers ──
@@ -183,6 +184,14 @@ export default function (pi: ExtensionAPI) {
 
         let codexUsage: CodexUsage | null = null;
         let codexUsageError: string | undefined;
+        let claudeUsage: ClaudeUsage | null = null;
+        if (provider === CLAUDE_PROVIDER && entry && Date.now() <= entry.expires) {
+          try {
+            claudeUsage = await fetchClaudeUsage(entry);
+          } catch {
+            // fall back to passively captured headers below
+          }
+        }
         if (provider === FALLBACK_PROVIDER && entry && Date.now() <= entry.expires) {
           try {
             codexUsage = await fetchCodexUsage(entry);
@@ -222,7 +231,15 @@ export default function (pi: ExtensionAPI) {
 
         // Codex has a live usage endpoint
         if (codexWindows.length > 0) {
-          lines.push(...formatCodexUsageLines(codexWindows, codexUsage?.plan_type));
+          lines.push(...formatCodexUsageLines(codexWindows, codexUsage?.plan_type, codexUsage?.additional_rate_limits));
+          lines.push(`  ⏰ Real-time`);
+          lines.push("");
+          continue;
+        }
+
+        // Claude has a live OAuth usage endpoint too (includes scoped limits like Fable)
+        if (claudeUsage?.limits?.length) {
+          lines.push(...formatClaudeUsageLines(claudeUsage.limits));
           lines.push(`  ⏰ Real-time`);
           lines.push("");
           continue;
@@ -232,37 +249,7 @@ export default function (pi: ExtensionAPI) {
         if (stale) {
           lines.push("  📈 Stale data, quota details fetched automatically after use");
         } else if (rl) {
-          if (rl.utilization) {
-            const pct = Math.round(Number(rl.utilization) * 100);
-            lines.push(`  📈 5h quota: ${makeBar(pct)} ${pct}%${rl.status ? ` (${rl.status})` : ""}`);
-          }
-          if (rl.weeklyUtilization) {
-            const pct = Math.round(Number(rl.weeklyUtilization) * 100);
-            lines.push(`  📈 Weekly quota:  ${makeBar(pct)} ${pct}%${rl.weeklyStatus ? ` (${rl.weeklyStatus})` : ""}`);
-          }
-          if (rl.requestsLimit && rl.requestsRemaining) {
-            const limit = Number(rl.requestsLimit);
-            const remaining = Number(rl.requestsRemaining);
-            const used = limit - remaining;
-            const pct = limit > 0 ? Math.round((used / limit) * 100) : 0;
-            lines.push(`  📈 Requests: ${used}/${limit} ${makeBar(pct)} ${pct}%`);
-          }
-          if (rl.tokensLimit && rl.tokensRemaining) {
-            const limit = Number(rl.tokensLimit);
-            const remaining = Number(rl.tokensRemaining);
-            const used = limit - remaining;
-            const pct = limit > 0 ? Math.round((used / limit) * 100) : 0;
-            lines.push(`  📈 Tokens:   ${formatTokens(used)}/${formatTokens(limit)} ${makeBar(pct)} ${pct}%`);
-          }
-          if (rl.reset) {
-            lines.push(`  🔄 5h window reset: ${formatReset(rl.reset)}`);
-          }
-          if (rl.weeklyReset) {
-            lines.push(`  🔄 Weekly window reset: ${formatReset(rl.weeklyReset)}`);
-          }
-          if (!rl.reset && !rl.weeklyReset && rl.tokensReset) {
-            lines.push(`  🔄 Window reset: ${rl.tokensReset}`);
-          }
+          lines.push(...formatPassiveRateLimitLines(rl));
           lines.push(`  ⏰ Data age: ${formatAge(rl.capturedAt ?? Date.now())}`);
         } else {
           lines.push(codexUsageError ? `  📈 Failed to fetch quota: ${codexUsageError}` : "  📈 Quota details fetched automatically after use");

@@ -32,6 +32,17 @@ export interface CodexWindow {
   reset_at: number;
 }
 
+export interface CodexAdditionalRateLimit {
+  limit_name?: string;
+  metered_feature?: string;
+  rate_limit?: {
+    allowed?: boolean;
+    limit_reached?: boolean;
+    primary_window?: CodexWindow;
+    secondary_window?: CodexWindow;
+  };
+}
+
 export interface CodexUsage {
   plan_type?: string;
   rate_limit?: {
@@ -40,6 +51,20 @@ export interface CodexUsage {
     primary_window?: CodexWindow;
     secondary_window?: CodexWindow;
   };
+  additional_rate_limits?: CodexAdditionalRateLimit[];
+}
+
+/** One entry of the Anthropic OAuth usage `limits` array (session / weekly_all / weekly_scoped e.g. Fable). */
+export interface ClaudeLimit {
+  kind?: string;
+  percent?: number; // 0-100
+  severity?: string;
+  resets_at?: string;
+  scope?: { model?: { display_name?: string | null } | null } | null;
+}
+
+export interface ClaudeUsage {
+  limits?: ClaudeLimit[];
 }
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -169,6 +194,18 @@ export async function fetchCodexUsage(entry: AuthEntry): Promise<CodexUsage | nu
   });
   if (!res.ok) throw new Error(`Codex usage HTTP ${res.status}`);
   return (await res.json()) as CodexUsage;
+}
+
+export async function fetchClaudeUsage(entry: AuthEntry): Promise<ClaudeUsage | null> {
+  const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+    headers: {
+      authorization: `Bearer ${entry.access}`,
+      "anthropic-beta": "oauth-2025-04-20",
+      accept: "application/json",
+    },
+  });
+  if (!res.ok) throw new Error(`Claude usage HTTP ${res.status}`);
+  return (await res.json()) as ClaudeUsage;
 }
 
 // ── Rate limit header parsers ──

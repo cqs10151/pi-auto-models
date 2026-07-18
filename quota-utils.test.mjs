@@ -105,9 +105,7 @@ test('Codex usage shows no 5h activity and labels long-reset window as weekly', 
     },
   ], 'pro');
 
-  assert.deepEqual(lines?.slice(0, 2), [
-    '  📈 5h quota: No 5h activity',
-    '  📈 Weekly quota: [███░░░░░░░░░░░░░░░░░] 13% (pro)',
-  ]);
-  assert.match(lines?.[2] ?? '', /^  🔄 Weekly window reset: /);
+  assert.equal(lines?.[0], '  📈 5h: no recent activity');
+  assert.match(lines?.[1] ?? '', /^  📈 Weekly \[███░{17}\]  13% \(pro\) · resets /);
+  assert.equal(lines?.length, 2);
 });
