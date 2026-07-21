@@ -138,6 +138,12 @@ export function setProviderRateLimit(provider: string, expiresAt: number): void 
   writeCache(cache);
 }
 
+export function clearProviderRateLimit(provider: string): void {
+  const cache = readCache();
+  delete cache[provider];
+  writeCache(cache);
+}
+
 export function getProviderRateLimitLeft(provider: string): number {
   const cache = readCache();
   const entry = cache[provider];

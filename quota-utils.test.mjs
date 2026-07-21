@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { getPassiveRateLimitCooldownMs, isProviderRateLimitError, isRateLimitInfoStale, parseCooldownMs } from './quota-utils.ts';
+import * as quotaUtils from './quota-utils.ts';
+
+const { getPassiveRateLimitCooldownMs, isProviderRateLimitError, isRateLimitInfoStale, parseCooldownMs } = quotaUtils;
 
 test('avoids Claude when passive 5h utilization is effectively exhausted', () => {
   const now = 1_700_000_000_000;
@@ -15,6 +17,12 @@ test('avoids Claude when passive 5h utilization is effectively exhausted', () =>
 
 test('does not avoid Claude for lower passive utilization warnings', () => {
   assert.equal(getPassiveRateLimitCooldownMs({ utilization: '0.98', status: 'allowed_warning' }, 1_700_000_000_000), 0);
+});
+
+test('treats live Claude usage below 100% as available', () => {
+  const usage = { limits: [{ percent: 5 }, { percent: 14 }, { percent: 26 }] };
+
+  assert.equal(quotaUtils.isClaudeUsageAvailable?.(usage), true);
 });
 
 test('treats passive rate limit data older than its window as stale', () => {
@@ -72,6 +80,16 @@ test('session start unhides the built-in working loader after reload', () => {
   const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
 
   assert.match(source, /pi\.on\("session_start", async \(_event, ctx\) => \{\n\s+ctx\.ui\.setWorkingVisible\(true\);/);
+});
+
+test('session start rechecks live Claude usage before honoring cached rate limits', () => {
+  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+  const sessionStart = source.match(/pi\.on\("session_start"[\s\S]*?pi\.on\("message_end"/)?.[0] ?? '';
+
+  assert.match(sessionStart, /claudeCooldownMs > 0/);
+  assert.match(sessionStart, /fetchClaudeUsage/);
+  assert.match(sessionStart, /isClaudeUsageAvailable/);
+  assert.match(sessionStart, /clearProviderRateLimit/);
 });
 
 test('formatWindowLabel labels windows by real duration, not position', async () => {

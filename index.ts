@@ -16,6 +16,7 @@ import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Text, SelectList, type SelectItem, matchesKey, Key } from "@earendil-works/pi-tui";
 import {
   getPassiveRateLimitCooldownMs,
+  isClaudeUsageAvailable,
   isProviderRateLimitError,
   isRateLimitInfoStale,
   parseCooldownMs,
@@ -34,6 +35,7 @@ import {
   readConfig,
   writeConfig,
   setProviderRateLimit,
+  clearProviderRateLimit,
   getProviderRateLimitLeft,
   readAuth,
   readRateLimits,
@@ -96,10 +98,25 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.setWorkingVisible(true);
-    const claudeCooldownMs = Math.max(
+    let claudeCooldownMs = Math.max(
       getProviderRateLimitLeft(CLAUDE_PROVIDER),
       getPassiveRateLimitCooldownMs(rateLimits.get(CLAUDE_PROVIDER)),
     );
+    if (claudeCooldownMs > 0 && CLAUDE_PROVIDER === DEFAULT_PRIMARY_PROVIDER) {
+      const entry = readAuth()[CLAUDE_PROVIDER];
+      if (entry && Date.now() <= entry.expires) {
+        try {
+          if (isClaudeUsageAvailable(await fetchClaudeUsage(entry))) {
+            clearProviderRateLimit(CLAUDE_PROVIDER);
+            rateLimits.delete(CLAUDE_PROVIDER);
+            writeRateLimits(rateLimits);
+            claudeCooldownMs = 0;
+          }
+        } catch {
+          // Keep the cached cooldown when live usage is unavailable.
+        }
+      }
+    }
     if (claudeCooldownMs > 0) {
       setProviderRateLimit(CLAUDE_PROVIDER, Date.now() + claudeCooldownMs);
       const ok = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);

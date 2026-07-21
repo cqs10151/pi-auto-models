@@ -34,6 +34,11 @@ export function getPassiveRateLimitCooldownMs(info: RateLimitInfo | undefined, n
   return Math.max(0, resetSeconds * 1000 - now);
 }
 
+export function isClaudeUsageAvailable(usage: { limits?: { percent?: number }[] } | null): boolean | undefined {
+  if (!usage?.limits?.length) return undefined;
+  return usage.limits.every((limit) => (limit.percent ?? 0) < 100);
+}
+
 export function isProviderRateLimitError(message: string | undefined): boolean {
   if (!message) return false;
   return /\b429\b|rate_limit_error|rate limit/i.test(message);
