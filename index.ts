@@ -1,8 +1,9 @@
 /**
- * Auto Model Switch Extension (Multi-tier 4-Model Fallback Chain)
+ * Auto Model Switch Extension (Multi-tier 4-Model Fallback Chain with Auto-Retry)
  *
  * Automatically falls back across 4 models on 429/529 rate limits:
  * Model 1 ➔ Model 2 ➔ Model 3 ➔ Model 4
+ * Seamlessly auto-retries the failed turn with the fallback model.
  * Recovers back to higher priority models once cooldown expires.
  */
 
@@ -19,6 +20,7 @@ import {
 import {
   type ThinkingLevel,
   type ModelSlot,
+  DEFAULT_MODELS,
   readConfig,
   writeConfig,
   setProviderRateLimit,
@@ -53,9 +55,10 @@ export default function (pi: ExtensionAPI) {
   let modelChain: ModelSlot[] = readConfig();
   let currentActiveIndex = 0;
   let lastRequestProvider: string | undefined;
+  let isSwitchingFallback = false;
   const rateLimits = new Map<string, RateLimitInfo>(Object.entries(readRateLimits()));
 
-  // 检查某个 Provider 是否被限流
+  // 检查某个 Provider 是否处于限流冷却期
   function getCooldownLeft(provider: string): number {
     return Math.max(
       getProviderRateLimitLeft(provider),
@@ -80,7 +83,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // 若全部处于限流/不可用状态，尝试强制选用第 1 个
+    // 若从 startFromIndex 往后全部限流，且不是从 0 开始搜索的，则回绕从 0 检查
     if (startFromIndex > 0) {
       return selectBestAvailableModel(ctx, 0);
     }
@@ -91,12 +94,12 @@ export default function (pi: ExtensionAPI) {
     lastRequestProvider = event.model?.provider ?? ctx.model?.provider ?? lastRequestProvider;
   });
 
-  // 会话启动时，优先尝试按优先级从第 1 个模型开始
+  // 会话启动时，优先尝试按优先级从最高位（Model 1）开始选择
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.setWorkingVisible(true);
     modelChain = readConfig();
 
-    // 如果首选模型是 Claude，尝试刷新一次在线配额状态
+    // 如果首选模型是 Claude，尝试刷新一次实时配额
     const primary = modelChain[0];
     if (primary && primary.provider === "anthropic") {
       const entry = readAuth()[primary.provider];
@@ -120,12 +123,12 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.theme.fg(isPrimary ? "success" : "warning", `⚡ [M${selected.index + 1}] ${selected.slot.model}`),
       );
       if (!isPrimary) {
-        ctx.ui.notify(`M1 限流中，当前已自动降级至 [M${selected.index + 1}] ${selected.slot.model}`, "info");
+        ctx.ui.notify(`M1 限流中，已启用备用模型 [M${selected.index + 1}] ${selected.slot.model}`, "info");
       }
     }
   });
 
-  // 捕获 API 错误（如流中断报错 429）
+  // 捕获请求异常流中的 429 错误
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
     if (!isProviderRateLimitError(event.message.errorMessage)) return;
@@ -136,11 +139,10 @@ export default function (pi: ExtensionAPI) {
     const cooldownMs = parseCooldownMs(undefined);
     setProviderRateLimit(provider, Date.now() + cooldownMs);
 
-    // 触发自动降级
-    await triggerFallback(ctx, provider, cooldownMs);
+    await triggerFallbackAndRetry(ctx, provider, cooldownMs);
   });
 
-  // 捕获 HTTP 429 / 529 响应头
+  // 捕获响应 Headers 中的 429 / 529 状态
   pi.on("after_provider_response", async (event, ctx) => {
     const headers = event.headers;
     const provider = lastRequestProvider ?? ctx.model?.provider;
@@ -160,26 +162,55 @@ export default function (pi: ExtensionAPI) {
       if (provider) {
         setProviderRateLimit(provider, Date.now() + cooldownMs);
       }
-      await triggerFallback(ctx, provider, cooldownMs);
+      await triggerFallbackAndRetry(ctx, provider, cooldownMs);
     }
   });
 
-  // 执行降级流程
-  async function triggerFallback(ctx: ExtensionContext, provider: string | undefined, cooldownMs: number) {
-    const nextTargetIndex = (currentActiveIndex + 1) % modelChain.length;
-    const selected = await selectBestAvailableModel(ctx, nextTargetIndex);
+  // 核心：执行降级并自动无感重发请求
+  async function triggerFallbackAndRetry(ctx: ExtensionContext, provider: string | undefined, cooldownMs: number) {
+    if (isSwitchingFallback) return; // 防抖，防止同一报错触发多次切换
+    isSwitchingFallback = true;
 
-    if (selected) {
-      currentActiveIndex = selected.index;
-      const minutes = Math.ceil(cooldownMs / 60000);
-      ctx.ui.setStatus(
-        "auto-model",
-        ctx.ui.theme.fg("warning", `⚡ [M${selected.index + 1}] ${selected.slot.model}`),
-      );
-      ctx.ui.notify(
-        `模型 ${provider ?? ""} 触发 429 限流，已秒切至 [M${selected.index + 1}] ${selected.slot.model} (恢复倒计时 ~${minutes}min)`,
-        "warning",
-      );
+    try {
+      const nextTargetIndex = (currentActiveIndex + 1) % modelChain.length;
+      const selected = await selectBestAvailableModel(ctx, nextTargetIndex);
+
+      if (selected) {
+        currentActiveIndex = selected.index;
+        const minutes = Math.ceil(cooldownMs / 60000);
+        ctx.ui.setStatus(
+          "auto-model",
+          ctx.ui.theme.fg("warning", `⚡ [M${selected.index + 1}] ${selected.slot.model}`),
+        );
+        ctx.ui.notify(
+          `模型 ${provider ?? ""} 触发 429 限流，已秒切至 [M${selected.index + 1}] ${selected.slot.model}，正在自动接管执行...`,
+          "warning",
+        );
+
+        // 延迟触发重试，确保状态和模型上下文完全切换就绪
+        setTimeout(() => {
+          try {
+            const anyPi = pi as any;
+            if (typeof anyPi.retry === "function") {
+              anyPi.retry();
+            } else if (typeof anyPi.sendMessage === "function") {
+              anyPi.sendMessage();
+            } else if (typeof anyPi.sendUserMessage === "function") {
+              anyPi.sendUserMessage();
+            } else if (typeof anyPi.send === "function") {
+              anyPi.send();
+            } else {
+              ctx.ui.notify(`模型已切换至 [M${selected.index + 1}]，请按回车继续`, "info");
+            }
+          } catch {
+            ctx.ui.notify(`模型已切换至 [M${selected.index + 1}]，请按回车继续`, "info");
+          }
+        }, 300);
+      }
+    } finally {
+      setTimeout(() => {
+        isSwitchingFallback = false;
+      }, 1000);
     }
   }
 
@@ -195,7 +226,7 @@ export default function (pi: ExtensionAPI) {
         label: `${m.provider}/${m.id}`,
       }));
 
-      // 1. 选择要配置哪一个槽位 (Model 1 ~ Model 4)
+      // 1. 选择槽位
       const slotIndexStr = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
@@ -232,7 +263,7 @@ export default function (pi: ExtensionAPI) {
       if (slotIndexStr === null) return;
       const targetIndex = parseInt(slotIndexStr, 10);
 
-      // 2. 选择具体模型 (带 Fuzzy 搜索)
+      // 2. 选择模型
       const chosenModel = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         let filter = "";
         const fzfMatch = (text: string, pattern: string): number => {
@@ -342,7 +373,6 @@ export default function (pi: ExtensionAPI) {
       const [provider, ...rest] = chosenModel.split("/");
       const modelId = rest.join("/");
 
-      // 更新内存与配置文件
       while (modelChain.length < 4) {
         modelChain.push(DEFAULT_MODELS[modelChain.length]);
       }
