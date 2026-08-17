@@ -1,14 +1,9 @@
 /**
- * Auto Model Switch Extension
+ * Auto Model Switch Extension (Multi-tier 4-Model Fallback Chain)
  *
- * On each session start, check whether Claude still has quota:
- * - has quota   → claude-opus-4-6 + high thinking
- * - no quota    → gpt-5.5 + high thinking
- *
- * Caches the rate-limit expiry time to avoid repeated checks.
- * Detects 429 in after_provider_response to auto-switch and cache.
- *
- * /usage command shows each provider's 5h quota usage.
+ * Automatically falls back across 4 models on 429/529 rate limits:
+ * Model 1 ➔ Model 2 ➔ Model 3 ➔ Model 4
+ * Recovers back to higher priority models once cooldown expires.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -18,20 +13,12 @@ import {
   getPassiveRateLimitCooldownMs,
   isClaudeUsageAvailable,
   isProviderRateLimitError,
-  isRateLimitInfoStale,
   parseCooldownMs,
   type RateLimitInfo,
 } from "./quota-utils.ts";
 import {
-  type CodexUsage,
-  type CodexWindow,
   type ThinkingLevel,
-  DEFAULT_PRIMARY_PROVIDER,
-  DEFAULT_PRIMARY_MODEL,
-  DEFAULT_PRIMARY_THINKING,
-  DEFAULT_FALLBACK_PROVIDER,
-  DEFAULT_FALLBACK_MODEL,
-  DEFAULT_FALLBACK_THINKING,
+  type ModelSlot,
   readConfig,
   writeConfig,
   setProviderRateLimit,
@@ -40,254 +27,166 @@ import {
   readAuth,
   readRateLimits,
   writeRateLimits,
-  fetchCodexUsage,
   fetchClaudeUsage,
-  type ClaudeUsage,
   parseAnthropicHeaders,
   parseOpenAIHeaders,
 } from "./quota-data.ts";
-import {
-  formatTimeLeft,
-  formatAge,
-  formatCodexUsageLines,
-  formatClaudeUsageLines,
-  formatPassiveRateLimitLines,
-} from "./format.ts";
-
-// ── Model helpers ──
 
 async function setModelTo(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  provider: string,
-  modelId: string,
-  thinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+  slot: ModelSlot,
 ): Promise<boolean> {
-  const model = ctx.modelRegistry.find(provider, modelId);
+  const model = ctx.modelRegistry.find(slot.provider, slot.model);
   if (!model) {
-    ctx.ui.notify(`Model ${provider}/${modelId} not found`, "warning");
     return false;
   }
   const ok = await pi.setModel(model);
   if (!ok) {
-    ctx.ui.notify(`No available API key for ${provider}/${modelId}`, "warning");
     return false;
   }
-  pi.setThinkingLevel(thinking);
+  pi.setThinkingLevel(slot.thinking);
   return true;
 }
 
-// ── Extension ──
-
 export default function (pi: ExtensionAPI) {
-  const cfg = readConfig();
-  let CLAUDE_PROVIDER = cfg.primary?.provider ?? DEFAULT_PRIMARY_PROVIDER;
-  let CLAUDE_MODEL = cfg.primary?.model ?? DEFAULT_PRIMARY_MODEL;
-  let CLAUDE_THINKING: ThinkingLevel = cfg.primary?.thinking ?? DEFAULT_PRIMARY_THINKING;
-  let FALLBACK_PROVIDER = cfg.fallback?.provider ?? DEFAULT_FALLBACK_PROVIDER;
-  let FALLBACK_MODEL = cfg.fallback?.model ?? DEFAULT_FALLBACK_MODEL;
-  let FALLBACK_THINKING: ThinkingLevel = cfg.fallback?.thinking ?? DEFAULT_FALLBACK_THINKING;
-
-  let usingClaude = false;
+  let modelChain: ModelSlot[] = readConfig();
+  let currentActiveIndex = 0;
   let lastRequestProvider: string | undefined;
   const rateLimits = new Map<string, RateLimitInfo>(Object.entries(readRateLimits()));
+
+  // 检查某个 Provider 是否被限流
+  function getCooldownLeft(provider: string): number {
+    return Math.max(
+      getProviderRateLimitLeft(provider),
+      getPassiveRateLimitCooldownMs(rateLimits.get(provider)),
+    );
+  }
+
+  // 沿降级链寻找下一个可用模型
+  async function selectBestAvailableModel(
+    ctx: ExtensionContext,
+    startFromIndex = 0,
+  ): Promise<{ index: number; slot: ModelSlot } | null> {
+    for (let i = startFromIndex; i < modelChain.length; i++) {
+      const slot = modelChain[i];
+      const cooldown = getCooldownLeft(slot.provider);
+
+      if (cooldown <= 0) {
+        const ok = await setModelTo(pi, ctx, slot);
+        if (ok) {
+          return { index: i, slot };
+        }
+      }
+    }
+
+    // 若全部处于限流/不可用状态，尝试强制选用第 1 个
+    if (startFromIndex > 0) {
+      return selectBestAvailableModel(ctx, 0);
+    }
+    return null;
+  }
 
   pi.on("before_provider_request", (event, ctx) => {
     lastRequestProvider = event.model?.provider ?? ctx.model?.provider ?? lastRequestProvider;
   });
 
+  // 会话启动时，优先尝试按优先级从第 1 个模型开始
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.setWorkingVisible(true);
-    let claudeCooldownMs = Math.max(
-      getProviderRateLimitLeft(CLAUDE_PROVIDER),
-      getPassiveRateLimitCooldownMs(rateLimits.get(CLAUDE_PROVIDER)),
-    );
-    if (claudeCooldownMs > 0 && CLAUDE_PROVIDER === DEFAULT_PRIMARY_PROVIDER) {
-      const entry = readAuth()[CLAUDE_PROVIDER];
+    modelChain = readConfig();
+
+    // 如果首选模型是 Claude，尝试刷新一次在线配额状态
+    const primary = modelChain[0];
+    if (primary && primary.provider === "anthropic") {
+      const entry = readAuth()[primary.provider];
       if (entry && Date.now() <= entry.expires) {
         try {
           if (isClaudeUsageAvailable(await fetchClaudeUsage(entry))) {
-            clearProviderRateLimit(CLAUDE_PROVIDER);
-            rateLimits.delete(CLAUDE_PROVIDER);
+            clearProviderRateLimit(primary.provider);
+            rateLimits.delete(primary.provider);
             writeRateLimits(rateLimits);
-            claudeCooldownMs = 0;
           }
-        } catch {
-          // Keep the cached cooldown when live usage is unavailable.
-        }
+        } catch {}
       }
     }
-    if (claudeCooldownMs > 0) {
-      setProviderRateLimit(CLAUDE_PROVIDER, Date.now() + claudeCooldownMs);
-      const ok = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);
-      if (ok) {
-        usingClaude = false;
-        ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
-        ctx.ui.notify(`Claude rate-limited, using ${FALLBACK_MODEL}`, "info");
-      }
-    } else {
-      const ok = await setModelTo(pi, ctx, CLAUDE_PROVIDER, CLAUDE_MODEL, CLAUDE_THINKING);
-      if (ok) {
-        usingClaude = true;
-        ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("success", `🧠 ${CLAUDE_MODEL}`));
-      } else {
-        const fallbackOk = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);
-        if (fallbackOk) {
-          usingClaude = false;
-          ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
-        }
+
+    const selected = await selectBestAvailableModel(ctx, 0);
+    if (selected) {
+      currentActiveIndex = selected.index;
+      const isPrimary = selected.index === 0;
+      ctx.ui.setStatus(
+        "auto-model",
+        ctx.ui.theme.fg(isPrimary ? "success" : "warning", `⚡ [M${selected.index + 1}] ${selected.slot.model}`),
+      );
+      if (!isPrimary) {
+        ctx.ui.notify(`M1 限流中，当前已自动降级至 [M${selected.index + 1}] ${selected.slot.model}`, "info");
       }
     }
   });
 
+  // 捕获 API 错误（如流中断报错 429）
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
     if (!isProviderRateLimitError(event.message.errorMessage)) return;
+
     const provider = event.message.provider ?? lastRequestProvider ?? ctx.model?.provider;
     if (!provider) return;
 
-    const existing = rateLimits.get(provider);
-    const existingReset = existing?.reset;
-    const existingResetMs = Number(existingReset) * 1000;
-    const hasExistingReset = Number.isFinite(existingResetMs) && existingResetMs > Date.now();
-    const cooldownMs = hasExistingReset ? existingResetMs - Date.now() : parseCooldownMs(undefined);
-
+    const cooldownMs = parseCooldownMs(undefined);
     setProviderRateLimit(provider, Date.now() + cooldownMs);
-    rateLimits.set(provider, {
-      ...existing,
-      utilization: "1",
-      status: "rate_limited",
-      ...(hasExistingReset ? { reset: existingReset } : {}),
-      capturedAt: Date.now(),
-    });
-    writeRateLimits(rateLimits);
 
-    if (usingClaude && provider === CLAUDE_PROVIDER) {
-      const ok = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);
-      if (ok) {
-        usingClaude = false;
-        ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
-        ctx.ui.notify(`Claude rate-limited, switched to ${FALLBACK_MODEL}`, "warning");
+    // 触发自动降级
+    await triggerFallback(ctx, provider, cooldownMs);
+  });
+
+  // 捕获 HTTP 429 / 529 响应头
+  pi.on("after_provider_response", async (event, ctx) => {
+    const headers = event.headers;
+    const provider = lastRequestProvider ?? ctx.model?.provider;
+
+    if (headers && provider) {
+      const info = parseAnthropicHeaders(headers) ?? parseOpenAIHeaders(headers);
+      if (info) {
+        rateLimits.set(provider, info);
+        writeRateLimits(rateLimits);
+        const passiveLeft = getPassiveRateLimitCooldownMs(info);
+        if (passiveLeft > 0) setProviderRateLimit(provider, Date.now() + passiveLeft);
       }
+    }
+
+    if (event.status === 429 || event.status === 529) {
+      const cooldownMs = parseCooldownMs(headers);
+      if (provider) {
+        setProviderRateLimit(provider, Date.now() + cooldownMs);
+      }
+      await triggerFallback(ctx, provider, cooldownMs);
     }
   });
 
-  // ── /usage command ──
+  // 执行降级流程
+  async function triggerFallback(ctx: ExtensionContext, provider: string | undefined, cooldownMs: number) {
+    const nextTargetIndex = (currentActiveIndex + 1) % modelChain.length;
+    const selected = await selectBestAvailableModel(ctx, nextTargetIndex);
 
-  pi.registerCommand("usage", {
-    description: "Show Claude / Codex quota usage",
-    handler: async (_args, ctx) => {
-      // ponytail: don't read ctx across await (stale after reload); capture UI only
-      const ui = ctx.ui;
-      ui.setWorkingMessage("Checking quota…");
-      ui.setWorkingVisible(true);
-      ui.setStatus("auto-model-usage", ui.theme.fg("warning", "⏳ Checking quota…"));
-      try {
-        const auth = readAuth();
-        const lines: string[] = [];
+    if (selected) {
+      currentActiveIndex = selected.index;
+      const minutes = Math.ceil(cooldownMs / 60000);
+      ctx.ui.setStatus(
+        "auto-model",
+        ctx.ui.theme.fg("warning", `⚡ [M${selected.index + 1}] ${selected.slot.model}`),
+      );
+      ctx.ui.notify(
+        `模型 ${provider ?? ""} 触发 429 限流，已秒切至 [M${selected.index + 1}] ${selected.slot.model} (恢复倒计时 ~${minutes}min)`,
+        "warning",
+      );
+    }
+  }
 
-      for (const provider of new Set([CLAUDE_PROVIDER, FALLBACK_PROVIDER])) {
-        const entry = auth[provider];
-        lines.push(`── Account (${provider}) ──`);
-
-        // Login status
-        if (!entry) {
-          lines.push("  🔑 Not logged in");
-        } else if (Date.now() > entry.expires) {
-          lines.push("  🔑 Token expired, please /login again");
-        } else {
-          lines.push(`  🔑 Logged in (token valid until ${new Date(entry.expires).toLocaleDateString()})`);
-        }
-
-        let codexUsage: CodexUsage | null = null;
-        let codexUsageError: string | undefined;
-        let claudeUsage: ClaudeUsage | null = null;
-        if (provider === CLAUDE_PROVIDER && entry && Date.now() <= entry.expires) {
-          try {
-            claudeUsage = await fetchClaudeUsage(entry);
-          } catch {
-            // fall back to passively captured headers below
-          }
-        }
-        if (provider === FALLBACK_PROVIDER && entry && Date.now() <= entry.expires) {
-          try {
-            codexUsage = await fetchCodexUsage(entry);
-          } catch (error) {
-            codexUsageError = error instanceof Error ? error.message : String(error);
-          }
-        }
-        // Whatever windows OpenAI returns (5h may be gone), labelled by real duration.
-        const codexWindows = [
-          codexUsage?.rate_limit?.primary_window,
-          codexUsage?.rate_limit?.secondary_window,
-        ].filter((w): w is CodexWindow => !!w);
-        // Most conservative recovery: the window that resets furthest out.
-        const codexGoverning = codexWindows.reduce<CodexWindow | undefined>(
-          (max, w) => (!max || w.reset_at > max.reset_at ? w : max),
-          undefined,
-        );
-
-        // Rate-limit status (supported for both providers)
-        const passiveLeft = getPassiveRateLimitCooldownMs(rateLimits.get(provider));
-        if (passiveLeft > 0) setProviderRateLimit(provider, Date.now() + passiveLeft);
-        const left = Math.max(getProviderRateLimitLeft(provider), passiveLeft);
-        const rl = rateLimits.get(provider);
-        const stale = isRateLimitInfoStale(rl);
-        if (codexUsage?.rate_limit?.limit_reached && codexGoverning) {
-          lines.push(`  📊 ❌ Rate-limited, recovers in ${formatTimeLeft(codexGoverning.reset_after_seconds * 1000)}`);
-          setProviderRateLimit(provider, codexGoverning.reset_at * 1000);
-        } else if (codexUsage?.rate_limit?.allowed) {
-          lines.push("  📊 ✅ Quota available");
-        } else if (left > 0) {
-          lines.push(`  📊 ❌ Rate-limited, recovers in ${formatTimeLeft(left)}`);
-        } else if (stale || (provider === CLAUDE_PROVIDER && !rl)) {
-          lines.push("  📊 Quota unknown");
-        } else {
-          lines.push("  📊 ✅ Quota available");
-        }
-
-        // Codex has a live usage endpoint
-        if (codexWindows.length > 0) {
-          lines.push(...formatCodexUsageLines(codexWindows, codexUsage?.plan_type, codexUsage?.additional_rate_limits));
-          lines.push(`  ⏰ Real-time`);
-          lines.push("");
-          continue;
-        }
-
-        // Claude has a live OAuth usage endpoint too (includes scoped limits like Fable)
-        if (claudeUsage?.limits?.length) {
-          lines.push(...formatClaudeUsageLines(claudeUsage.limits));
-          lines.push(`  ⏰ Real-time`);
-          lines.push("");
-          continue;
-        }
-
-        // Claude is captured passively from response headers
-        if (stale) {
-          lines.push("  📈 Stale data, quota details fetched automatically after use");
-        } else if (rl) {
-          lines.push(...formatPassiveRateLimitLines(rl));
-          lines.push(`  ⏰ Data age: ${formatAge(rl.capturedAt ?? Date.now())}`);
-        } else {
-          lines.push(codexUsageError ? `  📈 Failed to fetch quota: ${codexUsageError}` : "  📈 Quota details fetched automatically after use");
-        }
-
-        lines.push("");
-      }
-
-        ui.notify(lines.join("\n"), "info");
-      } finally {
-        ui.setWorkingVisible(true);
-        ui.setWorkingMessage(undefined);
-        ui.setStatus("auto-model-usage", undefined);
-      }
-    },
-  });
-
-  // ── /auto-model config command ──
+  // ── /auto-model 交互式配置 4 个模型 ──
 
   pi.registerCommand("auto-model", {
-    description: "Configure primary and fallback models",
+    description: "配置 4 级模型自动降级链条",
     handler: async (_args, ctx) => {
       const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
       const availableModels = ctx.modelRegistry.getAvailable();
@@ -296,17 +195,21 @@ export default function (pi: ExtensionAPI) {
         label: `${m.provider}/${m.id}`,
       }));
 
-      // Pick slot
-      const slot = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+      // 1. 选择要配置哪一个槽位 (Model 1 ~ Model 4)
+      const slotIndexStr = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-        container.addChild(new Text(theme.fg("accent", theme.bold("Configure Auto Model")), 1, 0));
-        container.addChild(new Text(theme.fg("muted", `Primary: ${CLAUDE_PROVIDER}/${CLAUDE_MODEL} (${CLAUDE_THINKING})`), 1, 0));
-        container.addChild(new Text(theme.fg("muted", `Fallback: ${FALLBACK_PROVIDER}/${FALLBACK_MODEL} (${FALLBACK_THINKING})`), 1, 0));
-        const items: SelectItem[] = [
-          { value: "primary", label: "Primary model", description: `${CLAUDE_PROVIDER}/${CLAUDE_MODEL}` },
-          { value: "fallback", label: "Fallback model", description: `${FALLBACK_PROVIDER}/${FALLBACK_MODEL}` },
-        ];
+        container.addChild(new Text(theme.fg("accent", theme.bold("Configure Fallback Chain (4 Slots)")), 1, 0));
+
+        const items: SelectItem[] = [0, 1, 2, 3].map((i) => {
+          const m = modelChain[i] || DEFAULT_MODELS[i];
+          return {
+            value: String(i),
+            label: `Model ${i + 1} (${i === 0 ? "Primary" : `Fallback ${i}`})`,
+            description: `${m.provider}/${m.model} [${m.thinking}]`,
+          };
+        });
+
         const list = new SelectList(items, 4, {
           selectedPrefix: (t) => theme.fg("accent", t),
           selectedText: (t) => theme.fg("accent", t),
@@ -317,7 +220,7 @@ export default function (pi: ExtensionAPI) {
         list.onSelect = (item) => done(item.value);
         list.onCancel = () => done(null);
         container.addChild(list);
-        container.addChild(new Text(theme.fg("dim", "↑↓ select • enter confirm • esc cancel"), 1, 0));
+        container.addChild(new Text(theme.fg("dim", "↑↓ select slot • enter confirm • esc cancel"), 1, 0));
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
         return {
           render: (w) => container.render(w),
@@ -325,13 +228,13 @@ export default function (pi: ExtensionAPI) {
           handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
         };
       });
-      if (!slot) return;
 
-      // Pick model (fzf fuzzy search)
-      const model = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+      if (slotIndexStr === null) return;
+      const targetIndex = parseInt(slotIndexStr, 10);
+
+      // 2. 选择具体模型 (带 Fuzzy 搜索)
+      const chosenModel = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         let filter = "";
-
-        // ponytail: fzf-style fuzzy match; chars in order, not required contiguous
         const fzfMatch = (text: string, pattern: string): number => {
           if (!pattern) return 1;
           const lower = text.toLowerCase();
@@ -343,33 +246,16 @@ export default function (pi: ExtensionAPI) {
           return j === p.length ? 1 : 0;
         };
 
-        const rebuildList = () => {
-          const filtered = filter
-            ? modelItems.filter((item) => fzfMatch(item.label, filter))
-            : modelItems;
-          // Rebuild SelectList
-          container.removeChild(list);
-          container.removeChild(helpText);
-          container.removeChild(bottomBorder);
-          list = new SelectList(filtered, Math.min(filtered.length, 12), selectTheme);
-          list.onSelect = (item) => done(item.value);
-          list.onCancel = () => done(null);
-          container.addChild(list);
-          container.addChild(helpText);
-          container.addChild(bottomBorder);
-          container.invalidate();
-        };
-
         const container = new Container();
         container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
         const titleText = new Text("", 1, 0);
         const updateTitle = () => {
-          const label = slot === "primary" ? "Primary" : "Fallback";
           const searchHint = filter ? theme.fg("accent", ` ❯ ${filter}`) : theme.fg("dim", " (type to search)");
-          titleText.setText(theme.fg("accent", theme.bold(`Select ${label} model`)) + searchHint);
+          titleText.setText(theme.fg("accent", theme.bold(`Select Model for Slot ${targetIndex + 1}`)) + searchHint);
         };
         updateTitle();
         container.addChild(titleText);
+
         const selectTheme = {
           selectedPrefix: (t: string) => theme.fg("accent", t),
           selectedText: (t: string) => theme.fg("accent", t),
@@ -385,6 +271,23 @@ export default function (pi: ExtensionAPI) {
         container.addChild(helpText);
         const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
         container.addChild(bottomBorder);
+
+        const rebuildList = () => {
+          const filtered = filter
+            ? modelItems.filter((item) => fzfMatch(item.label, filter))
+            : modelItems;
+          container.removeChild(list);
+          container.removeChild(helpText);
+          container.removeChild(bottomBorder);
+          list = new SelectList(filtered, Math.min(filtered.length, 12), selectTheme);
+          list.onSelect = (item) => done(item.value);
+          list.onCancel = () => done(null);
+          container.addChild(list);
+          container.addChild(helpText);
+          container.addChild(bottomBorder);
+          container.invalidate();
+        };
+
         return {
           render: (w) => container.render(w),
           invalidate: () => container.invalidate(),
@@ -406,9 +309,10 @@ export default function (pi: ExtensionAPI) {
           },
         };
       });
-      if (!model) return;
 
-      // Pick thinking level
+      if (!chosenModel) return;
+
+      // 3. 选择 Thinking Level
       const thinkingItems: SelectItem[] = THINKING_LEVELS.map((l) => ({ value: l, label: l }));
       const thinking = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
         const container = new Container();
@@ -432,67 +336,24 @@ export default function (pi: ExtensionAPI) {
           handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
         };
       });
+
       if (!thinking) return;
 
-      const [provider, ...rest] = model.split("/");
+      const [provider, ...rest] = chosenModel.split("/");
       const modelId = rest.join("/");
-      const thinkingLevel = thinking as ThinkingLevel;
 
-      // Update runtime variables
-      if (slot === "primary") {
-        CLAUDE_PROVIDER = provider;
-        CLAUDE_MODEL = modelId;
-        CLAUDE_THINKING = thinkingLevel;
-      } else {
-        FALLBACK_PROVIDER = provider;
-        FALLBACK_MODEL = modelId;
-        FALLBACK_THINKING = thinkingLevel;
+      // 更新内存与配置文件
+      while (modelChain.length < 4) {
+        modelChain.push(DEFAULT_MODELS[modelChain.length]);
       }
+      modelChain[targetIndex] = {
+        provider,
+        model: modelId,
+        thinking: thinking as ThinkingLevel,
+      };
 
-      // Persist
-      const newCfg = readConfig();
-      newCfg[slot as "primary" | "fallback"] = { provider, model: modelId, thinking: thinkingLevel };
-      writeConfig(newCfg);
-
-      ctx.ui.notify(`${slot === "primary" ? "Primary" : "Fallback"} set to ${model} (${thinkingLevel})`, "info");
+      writeConfig(modelChain);
+      ctx.ui.notify(`Slot ${targetIndex + 1} 已成功更新为 ${chosenModel} (${thinking})`, "info");
     },
-  });
-
-  // ── Response interception ──
-
-  pi.on("after_provider_response", async (event, ctx) => {
-    const headers = event.headers;
-    const provider = lastRequestProvider ?? ctx.model?.provider;
-
-    // Passively capture rate limit headers (Claude has them, Codex doesn't)
-    if (headers && provider) {
-      const info = parseAnthropicHeaders(headers) ?? parseOpenAIHeaders(headers);
-      if (info) {
-        rateLimits.set(provider, info);
-        writeRateLimits(rateLimits);
-        const passiveLeft = getPassiveRateLimitCooldownMs(info);
-        if (passiveLeft > 0) setProviderRateLimit(provider, Date.now() + passiveLeft);
-      }
-    }
-
-    // 429/529 → record rate limit and switch model
-    if (event.status === 429 || event.status === 529) {
-      const cooldownMs = parseCooldownMs(headers);
-
-      if (provider) {
-        setProviderRateLimit(provider, Date.now() + cooldownMs);
-      }
-
-      // If Claude is currently rate-limited, switch to Codex
-      if (usingClaude && (provider === CLAUDE_PROVIDER || !provider)) {
-        const ok = await setModelTo(pi, ctx, FALLBACK_PROVIDER, FALLBACK_MODEL, FALLBACK_THINKING);
-        if (ok) {
-          usingClaude = false;
-          const minutes = Math.round(cooldownMs / 60000);
-          ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("warning", `⚡ ${FALLBACK_MODEL}`));
-          ctx.ui.notify(`Claude rate-limited, switched to ${FALLBACK_MODEL}, retry in ${minutes}min`, "warning");
-        }
-      }
-    }
   });
 }

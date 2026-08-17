@@ -6,8 +6,7 @@ A [pi](https://pi.dev) extension that automatically switches between a **primary
 
 - **Auto-switch on quota** — on each session start it uses the primary model if quota is available, otherwise the fallback.
 - **429/529 recovery** — detects rate-limit responses, caches the cooldown, and switches to the fallback mid-session.
-- **Passive quota tracking** — reads rate-limit headers from provider responses (no extra requests for Claude); Codex quota is fetched live.
-- **`/usage`** — shows each provider's quota windows (Codex windows are labelled by their actual duration, so it adapts if OpenAI drops the 5h window).
+- **Passive quota tracking** — reads rate-limit headers from provider responses to detect limits before they block you.
 - **`/auto-model`** — interactive TUI to configure the primary/fallback model and thinking level.
 
 ## Install
@@ -32,7 +31,6 @@ pi -e npm:pi-auto-models
 
 | Command | Description |
 |---------|-------------|
-| `/usage` | Show Claude / Codex quota usage |
 | `/auto-model` | Configure primary and fallback models (model + thinking level) |
 
 ## Configuration
@@ -41,8 +39,12 @@ pi -e npm:pi-auto-models
 
 ```json
 {
-  "primary":  { "provider": "anthropic",   "model": "claude-opus-4-6", "thinking": "high" },
-  "fallback": { "provider": "openai-codex", "model": "gpt-5.5",        "thinking": "high" }
+  "models": [
+    { "provider": "anthropic",   "model": "claude-opus-4-6",               "thinking": "high" },
+    { "provider": "openai-codex", "model": "gpt-5.5",                     "thinking": "high" },
+    { "provider": "openrouter",   "model": "google/gemma-4-31b-it:free",  "thinking": "off" },
+    { "provider": "openrouter",   "model": "openai/gpt-oss-20b:free",      "thinking": "off" }
+  ]
 }
 ```
 
@@ -50,8 +52,10 @@ Defaults (used when the file is absent):
 
 | Slot | Provider | Model | Thinking |
 |------|----------|-------|----------|
-| Primary | `anthropic` | `claude-opus-4-6` | `high` |
-| Fallback | `openai-codex` | `gpt-5.5` | `high` |
+| M1 (Primary) | `anthropic` | `claude-opus-4-6` | `high` |
+| M2 (Fallback 1) | `openai-codex` | `gpt-5.5` | `high` |
+| M3 (Fallback 2) | `openrouter` | `google/gemma-4-31b-it:free` | `off` |
+| M4 (Fallback 3) | `openrouter` | `openai/gpt-oss-20b:free` | `off` |
 
 Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`.
 

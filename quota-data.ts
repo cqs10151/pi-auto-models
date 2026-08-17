@@ -1,6 +1,6 @@
 /**
  * Data layer: types, persistence (config/cache/auth/rate-limits),
- * Codex usage fetching, and rate-limit header parsing.
+ * Claude usage fetching, and rate-limit header parsing.
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -25,39 +25,9 @@ export interface AuthEntry {
   accountId?: string;
 }
 
-export interface CodexWindow {
-  used_percent: number;
-  limit_window_seconds: number;
-  reset_after_seconds: number;
-  reset_at: number;
-}
-
-export interface CodexAdditionalRateLimit {
-  limit_name?: string;
-  metered_feature?: string;
-  rate_limit?: {
-    allowed?: boolean;
-    limit_reached?: boolean;
-    primary_window?: CodexWindow;
-    secondary_window?: CodexWindow;
-  };
-}
-
-export interface CodexUsage {
-  plan_type?: string;
-  rate_limit?: {
-    allowed: boolean;
-    limit_reached: boolean;
-    primary_window?: CodexWindow;
-    secondary_window?: CodexWindow;
-  };
-  additional_rate_limits?: CodexAdditionalRateLimit[];
-}
-
-/** One entry of the Anthropic OAuth usage `limits` array (session / weekly_all / weekly_scoped e.g. Fable). */
 export interface ClaudeLimit {
   kind?: string;
-  percent?: number; // 0-100
+  percent?: number;
   severity?: string;
   resets_at?: string;
   scope?: { model?: { display_name?: string | null } | null } | null;
@@ -69,9 +39,17 @@ export interface ClaudeUsage {
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+export interface ModelSlot {
+  provider: string;
+  model: string;
+  thinking: ThinkingLevel;
+}
+
 export interface AutoModelConfig {
-  primary?: { provider?: string; model?: string; thinking?: ThinkingLevel };
-  fallback?: { provider?: string; model?: string; thinking?: ThinkingLevel };
+  models?: ModelSlot[];
+  // Compatibility fields
+  primary?: ModelSlot;
+  fallback?: ModelSlot;
 }
 
 // ── Constants ──
@@ -81,29 +59,42 @@ const AUTH_FILE = join(getAgentDir(), "auth.json");
 const CACHE_FILE = join(getAgentDir(), "claude-quota-cache.json");
 const RATE_LIMIT_FILE = join(getAgentDir(), "auto-model-rate-limits.json");
 
-export const DEFAULT_PRIMARY_PROVIDER = "anthropic";
-export const DEFAULT_PRIMARY_MODEL = "claude-opus-4-6";
-export const DEFAULT_PRIMARY_THINKING: ThinkingLevel = "high";
-
-export const DEFAULT_FALLBACK_PROVIDER = "openai-codex";
-export const DEFAULT_FALLBACK_MODEL = "gpt-5.5";
-export const DEFAULT_FALLBACK_THINKING: ThinkingLevel = "high";
+// 默认 4 个降级模型梯队
+export const DEFAULT_MODELS: ModelSlot[] = [
+  { provider: "anthropic", model: "claude-opus-4-6", thinking: "high" },
+  { provider: "openai-codex", model: "gpt-5.5", thinking: "high" },
+  { provider: "openrouter", model: "google/gemma-4-31b-it:free", thinking: "off" },
+  { provider: "openrouter", model: "openai/gpt-oss-20b:free", thinking: "off" },
+];
 
 // ── Config ──
 
-export function readConfig(): AutoModelConfig {
+export function readConfig(): ModelSlot[] {
   try {
-    if (!existsSync(CONFIG_FILE)) return {};
-    return JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as AutoModelConfig;
+    if (!existsSync(CONFIG_FILE)) return DEFAULT_MODELS;
+    const cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as AutoModelConfig;
+    if (Array.isArray(cfg.models) && cfg.models.length > 0) {
+      return cfg.models;
+    }
+    // Backward compatibility for primary & fallback format
+    if (cfg.primary && cfg.fallback) {
+      return [
+        { provider: cfg.primary.provider ?? DEFAULT_MODELS[0].provider, model: cfg.primary.model ?? DEFAULT_MODELS[0].model, thinking: cfg.primary.thinking ?? "high" },
+        { provider: cfg.fallback.provider ?? DEFAULT_MODELS[1].provider, model: cfg.fallback.model ?? DEFAULT_MODELS[1].model, thinking: cfg.fallback.thinking ?? "high" },
+        DEFAULT_MODELS[2],
+        DEFAULT_MODELS[3],
+      ];
+    }
+    return DEFAULT_MODELS;
   } catch {
-    return {};
+    return DEFAULT_MODELS;
   }
 }
 
-export function writeConfig(cfg: AutoModelConfig): void {
+export function writeConfig(models: ModelSlot[]): void {
   try {
     mkdirSync(dirname(CONFIG_FILE), { recursive: true });
-    writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
+    writeFileSync(CONFIG_FILE, JSON.stringify({ models }, null, 2), "utf-8");
   } catch {}
 }
 
@@ -113,9 +104,8 @@ function readCache(): QuotaCache {
   try {
     if (!existsSync(CACHE_FILE)) return {};
     const raw = JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
-    // Backward-compat with legacy format { rateLimitExpiresAt: number }
     if (typeof raw.rateLimitExpiresAt === "number") {
-      return { [DEFAULT_PRIMARY_PROVIDER]: { rateLimitExpiresAt: raw.rateLimitExpiresAt } };
+      return { [DEFAULT_MODELS[0].provider]: { rateLimitExpiresAt: raw.rateLimitExpiresAt } };
     }
     return raw as QuotaCache;
   } catch {
@@ -127,9 +117,7 @@ function writeCache(cache: QuotaCache): void {
   try {
     mkdirSync(dirname(CACHE_FILE), { recursive: true });
     writeFileSync(CACHE_FILE, JSON.stringify(cache), "utf-8");
-  } catch {
-    // ponytail: if the write fails, just ignore it
-  }
+  } catch {}
 }
 
 export function setProviderRateLimit(provider: string, expiresAt: number): void {
@@ -175,31 +163,6 @@ export function writeRateLimits(rateLimits: Map<string, RateLimitInfo>): void {
   try {
     writeFileSync(RATE_LIMIT_FILE, JSON.stringify(Object.fromEntries(rateLimits), null, 2), "utf-8");
   } catch {}
-}
-
-// ── Codex usage ──
-
-function extractCodexAccountId(token: string): string | undefined {
-  try {
-    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf-8"));
-    return payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-  } catch {
-    return undefined;
-  }
-}
-
-export async function fetchCodexUsage(entry: AuthEntry): Promise<CodexUsage | null> {
-  const accountId = entry.accountId ?? extractCodexAccountId(entry.access);
-  const res = await fetch("https://chatgpt.com/backend-api/codex/usage", {
-    headers: {
-      authorization: `Bearer ${entry.access}`,
-      ...(accountId ? { "chatgpt-account-id": accountId } : {}),
-      originator: "pi",
-      accept: "application/json",
-    },
-  });
-  if (!res.ok) throw new Error(`Codex usage HTTP ${res.status}`);
-  return (await res.json()) as CodexUsage;
 }
 
 export async function fetchClaudeUsage(entry: AuthEntry): Promise<ClaudeUsage | null> {
