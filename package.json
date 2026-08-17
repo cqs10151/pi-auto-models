@@ -1,15 +1,12 @@
 {
   "name": "pi-auto-models",
-  "version": "0.1.9",
-  "description": "Auto-switch pi between a primary and fallback model based on quota, with /auto-model command.",
+  "version": "0.2.1",
+  "description": "Auto-switch pi across a 4-tier model fallback chain on any error (400/429/529/unusable), with intent-aware manual override.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Fatpandac/pi-auto-models.git"
   },
   "license": "MIT",
-  "scripts": {
-    "release": "npm version patch && git push --follow-tags origin main"
-  },
   "keywords": [
     "pi-package"
   ],

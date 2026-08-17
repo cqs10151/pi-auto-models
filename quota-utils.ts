@@ -1,72 +1,78 @@
-export interface RateLimitInfo {
-  utilization?: string;
-  status?: string;
-  reset?: string;
-  weeklyUtilization?: string;
-  weeklyStatus?: string;
-  weeklyReset?: string;
-  requestsLimit?: string;
-  requestsRemaining?: string;
-  requestsReset?: string;
-  tokensLimit?: string;
-  tokensRemaining?: string;
-  tokensReset?: string;
-  capturedAt?: number;
-}
+/**
+ * Quota & Cooldown Utilities
+ */
 
-const PASSIVE_LIMIT_THRESHOLD = 0.99;
-const PASSIVE_RATE_LIMIT_STALE_MS = 5 * 60 * 60 * 1000;
-const DEFAULT_COOLDOWN_MS = 5 * 60 * 60 * 1000;
-
-export function isRateLimitInfoStale(info: RateLimitInfo | undefined, now = Date.now()): boolean {
-  if (!info?.capturedAt) return false;
-  return now - info.capturedAt > PASSIVE_RATE_LIMIT_STALE_MS;
-}
-
-export function getPassiveRateLimitCooldownMs(info: RateLimitInfo | undefined, now = Date.now()): number {
-  if (!info?.utilization) return 0;
-  if (isRateLimitInfoStale(info, now)) return 0;
-  if (Number(info.utilization) < PASSIVE_LIMIT_THRESHOLD) return 0;
-  if (!info.reset) return 0;
-
-  const resetSeconds = Number(info.reset);
-  if (!Number.isFinite(resetSeconds)) return 0;
-  return Math.max(0, resetSeconds * 1000 - now);
-}
-
-export function isClaudeUsageAvailable(usage: { limits?: { percent?: number }[] } | null): boolean | undefined {
-  if (!usage?.limits?.length) return undefined;
-  return usage.limits.every((limit) => (limit.percent ?? 0) < 100);
-}
-
-export function isProviderRateLimitError(message: string | undefined): boolean {
-  if (!message) return false;
-  return /\b429\b|rate_limit_error|rate limit/i.test(message);
-}
-
-export function parseCooldownMs(
-  headers: Record<string, string> | undefined,
-  now = Date.now(),
-  defaultCooldownMs = DEFAULT_COOLDOWN_MS,
-): number {
-  if (!headers) return defaultCooldownMs;
-  const reset = headers["anthropic-ratelimit-unified-5h-reset"] ?? headers["anthropic-ratelimit-unified-reset"];
-  if (reset) {
-    const seconds = Number(reset);
-    if (Number.isFinite(seconds)) {
-      const ms = seconds * 1000 - now;
-      if (ms > 0) return ms;
-    }
+/**
+ * 统一将 Header 的 Key 转换为小写，兼容不同格式的 Header 结构
+ */
+export function normalizeHeaders(
+  headers: Record<string, string | string[] | undefined> | undefined,
+): Record<string, string> {
+  if (!headers) return {};
+  const normalized: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (v === undefined || v === null) continue;
+    normalized[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : String(v);
   }
-  const retryAfterMs = headers["retry-after-ms"];
-  if (retryAfterMs) {
-    const ms = Number(retryAfterMs);
+  return normalized;
+}
+
+/**
+ * 尝试从响应头解析重试冷却毫秒数，若无法解析则返回默认冷却时间
+ */
+export function parseRetryCooldownMs(
+  rawHeaders: Record<string, any> | undefined,
+  defaultMs = 60 * 1000,
+): number {
+  if (!rawHeaders) return defaultMs;
+  const headers = normalizeHeaders(rawHeaders);
+
+  // 1. 显式毫秒级响应头
+  const retryMs = headers["retry-after-ms"];
+  if (retryMs) {
+    const ms = Number(retryMs);
     if (!Number.isNaN(ms) && ms > 0) return ms;
   }
-  const retryAfter = headers["retry-after"];
+
+  // 2. 标准 Retry-After (秒数 或 HTTP-Date)
+  const retryAfter = headers["retry-after"] ?? headers["retry-after-seconds"];
   if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (!Number.isNaN(seconds) && seconds > 0) return seconds * 1000;
+    const num = Number(retryAfter);
+    if (!Number.isNaN(num) && num > 0) {
+      return num * 1000;
+    }
+    const dateMs = Date.parse(retryAfter);
+    if (!Number.isNaN(dateMs)) {
+      return Math.max(0, dateMs - Date.now());
+    }
   }
-  return defaultCooldownMs;
+
+  // 3. 通用 RateLimit Reset 头部 (覆盖 OpenAI, Anthropic, Cloudflare, Groq 等厂商)
+  const resetHeader =
+    headers["x-ratelimit-reset-requests"] ??
+    headers["x-ratelimit-reset-tokens"] ??
+    headers["x-ratelimit-reset"] ??
+    headers["ratelimit-reset"] ??
+    headers["x-ratelimit-reset-after"];
+
+  if (resetHeader) {
+    const num = Number(resetHeader);
+    if (!Number.isNaN(num) && num > 0) {
+      // 若数值大于 1e9，视为 Unix 时间戳（秒）
+      if (num > 1e9) {
+        return Math.max(0, num * 1000 - Date.now());
+      }
+      // 否则视为相对重置秒数
+      return num * 1000;
+    }
+  }
+
+  return defaultMs;
+}
+
+/**
+ * 生成唯一的模型标识 key
+ */
+export function getModelKey(provider: string, model: string): string {
+  return `${provider}/${model}`;
 }
