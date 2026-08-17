@@ -53,14 +53,13 @@ function safeWriteJsonSync(filePath: string, data: unknown): void {
 }
 
 /**
- * 读取 M1~M4 槽位配置（包含严格的结构清洗与缺省补齐）
+ * 读取 M1~M4 槽位配置
  */
 export function readConfig(): ModelSlot[] {
   try {
     if (!existsSync(CONFIG_FILE)) return [...DEFAULT_MODELS];
     const cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as AutoModelConfig;
     if (Array.isArray(cfg.models) && cfg.models.length > 0) {
-      // 过滤无效或格式损坏的配置项
       const validModels: ModelSlot[] = cfg.models
         .filter((m): m is ModelSlot => Boolean(m && typeof m.provider === "string" && typeof m.model === "string"))
         .map((m) => ({

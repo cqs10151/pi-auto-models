@@ -3,7 +3,7 @@
  */
 
 /**
- * 统一将 Header 的 Key 转换为小写，兼容不同格式的 Header 结构
+ * 统一将 Header 的 Key 转换为小写，兼容各种 HTTP Headers 格式
  */
 export function normalizeHeaders(
   headers: Record<string, string | string[] | undefined> | undefined,
@@ -47,7 +47,7 @@ export function parseRetryCooldownMs(
     }
   }
 
-  // 3. 通用 RateLimit Reset 头部 (覆盖 OpenAI, Anthropic, Cloudflare, Groq 等厂商)
+  // 3. 通用 RateLimit Reset 头部
   const resetHeader =
     headers["x-ratelimit-reset-requests"] ??
     headers["x-ratelimit-reset-tokens"] ??
@@ -58,11 +58,9 @@ export function parseRetryCooldownMs(
   if (resetHeader) {
     const num = Number(resetHeader);
     if (!Number.isNaN(num) && num > 0) {
-      // 若数值大于 1e9，视为 Unix 时间戳（秒）
       if (num > 1e9) {
         return Math.max(0, num * 1000 - Date.now());
       }
-      // 否则视为相对重置秒数
       return num * 1000;
     }
   }
