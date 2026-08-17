@@ -1,15 +1,23 @@
 /**
- * Quota & Cooldown Utilities
+ * Quota & Cooldown Utilities (Enhanced)
  */
 
 /**
- * 统一将 Header 的 Key 转换为小写，兼容各种 HTTP Headers 格式
+ * 兼容标准 Headers 实例与普通 Record 对象
  */
 export function normalizeHeaders(
-  headers: Record<string, string | string[] | undefined> | undefined,
+  headers: Record<string, any> | Headers | undefined,
 ): Record<string, string> {
   if (!headers) return {};
   const normalized: Record<string, string> = {};
+
+  if (typeof (headers as any).forEach === "function") {
+    (headers as Headers).forEach((value, key) => {
+      normalized[key.toLowerCase()] = value;
+    });
+    return normalized;
+  }
+
   for (const [k, v] of Object.entries(headers)) {
     if (v === undefined || v === null) continue;
     normalized[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : String(v);
@@ -18,13 +26,13 @@ export function normalizeHeaders(
 }
 
 /**
- * 尝试从响应头解析重试冷却毫秒数，若无法解析则返回默认冷却时间
+ * 从响应头解析冷却时间，并结合失败次数做指数退避
  */
 export function parseRetryCooldownMs(
-  rawHeaders: Record<string, any> | undefined,
-  defaultMs = 60 * 1000,
+  rawHeaders: Record<string, any> | Headers | undefined,
+  consecutiveFailures: number = 1,
+  baseDefaultMs = 60 * 1000,
 ): number {
-  if (!rawHeaders) return defaultMs;
   const headers = normalizeHeaders(rawHeaders);
 
   // 1. 显式毫秒级响应头
@@ -65,12 +73,12 @@ export function parseRetryCooldownMs(
     }
   }
 
-  return defaultMs;
+  // 4. 指数退避倍率: 1次=1x(60s), 2次=3x(3m), 3次=10x(10m), 4次以上=30x(30m)
+  const backoffMultipliers = [1, 1, 3, 10, 30];
+  const multiplier = backoffMultipliers[Math.min(consecutiveFailures, backoffMultipliers.length - 1)];
+  return baseDefaultMs * multiplier;
 }
 
-/**
- * 生成唯一的模型标识 key
- */
 export function getModelKey(provider: string, model: string): string {
   return `${provider}/${model}`;
 }
