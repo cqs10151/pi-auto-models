@@ -19,6 +19,7 @@ export interface AutoModelConfig {
   models?: ModelSlot[];
 }
 
+export const MAX_SLOTS = 4;
 const CONFIG_FILE = join(getAgentDir(), "auto-model.json");
 
 export const VALID_THINKING_LEVELS: readonly ThinkingLevel[] = [
@@ -38,7 +39,7 @@ export const DEFAULT_MODELS: ModelSlot[] = [
 ];
 
 /**
- * 安全的原子文件写入
+ * 安全的原子文件写入 (加固：异常明确感知与日志记录)
  */
 function safeWriteJsonSync(filePath: string, data: unknown): void {
   try {
@@ -48,17 +49,18 @@ function safeWriteJsonSync(filePath: string, data: unknown): void {
     writeFileSync(tempPath, JSON.stringify(data, null, 2), "utf-8");
     renameSync(tempPath, filePath);
   } catch (err) {
-    console.error("[pi-auto-models] Failed to write config:", err);
+    console.error("[pi-auto-models] Failed to atomically write config:", err);
   }
 }
 
 /**
- * 读取 M1~M4 槽位配置
+ * 读取 M1~M4 槽位配置 (加固：严格固定 4 槽位，解析错误安全回退并输出警告)
  */
 export function readConfig(): ModelSlot[] {
   try {
     if (!existsSync(CONFIG_FILE)) return [...DEFAULT_MODELS];
-    const cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as AutoModelConfig;
+    const raw = readFileSync(CONFIG_FILE, "utf-8");
+    const cfg = JSON.parse(raw) as AutoModelConfig;
     if (Array.isArray(cfg.models) && cfg.models.length > 0) {
       const validModels: ModelSlot[] = cfg.models
         .filter((m): m is ModelSlot => Boolean(m && typeof m.provider === "string" && typeof m.model === "string"))
@@ -68,13 +70,14 @@ export function readConfig(): ModelSlot[] {
           thinking: VALID_THINKING_LEVELS.includes(m.thinking) ? m.thinking : "off",
         }));
 
-      while (validModels.length < 4) {
+      while (validModels.length < MAX_SLOTS) {
         validModels.push(DEFAULT_MODELS[validModels.length]);
       }
-      return validModels.slice(0, 4);
+      return validModels.slice(0, MAX_SLOTS);
     }
     return [...DEFAULT_MODELS];
-  } catch {
+  } catch (err) {
+    console.warn("[pi-auto-models] Failed to read auto-model.json, falling back to defaults:", err);
     return [...DEFAULT_MODELS];
   }
 }
@@ -83,5 +86,6 @@ export function readConfig(): ModelSlot[] {
  * 持久化 M1~M4 槽位配置
  */
 export function writeConfig(models: ModelSlot[]): void {
-  safeWriteJsonSync(CONFIG_FILE, { models });
+  const sanitized = models.slice(0, MAX_SLOTS);
+  safeWriteJsonSync(CONFIG_FILE, { models: sanitized });
 }

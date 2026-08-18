@@ -9,6 +9,7 @@ import { Container, Text, SelectList, type SelectItem, matchesKey, Key } from "@
 import {
   type ThinkingLevel,
   type ModelSlot,
+  MAX_SLOTS,
   DEFAULT_MODELS,
   VALID_THINKING_LEVELS,
   readConfig,
@@ -28,7 +29,7 @@ export default function (pi: ExtensionAPI) {
   const FALLBACK_COOLDOWN_MS = 2000;          // 双拦截事件防抖冷却窗口 (2秒)
 
   /**
-   * 清理悬挂定时器并重置降级锁
+   * 清理悬挂定时器并重置降级锁 (G2: 先清空句柄消除竞态)
    */
   function clearRetryTimer() {
     if (retryTimer) {
@@ -39,31 +40,35 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 容错匹配注册表中的模型 (支持 :free 后缀/大小写容错)
+   * 精准容错匹配注册表中的模型 (G3: 移除过度宽松的 endsWith，仅保留精确与 :free 变体)
    */
   function findModelInRegistry(ctx: ExtensionContext, provider: string, modelId: string) {
+    const pLower = provider.toLowerCase();
+    const mLower = modelId.toLowerCase();
+    const stripped = modelId.replace(/:free$/i, "");
+    const strippedLower = stripped.toLowerCase();
+    const withFree = `${stripped}:free`;
+    const withFreeLower = withFree.toLowerCase();
+
     // 1. 精确查找
     let model = ctx.modelRegistry.find(provider, modelId);
     if (model) return model;
 
     // 2. 剥离/追加 :free 变体查找
-    const stripped = modelId.replace(/:free$/i, "");
     model = ctx.modelRegistry.find(provider, stripped);
     if (model) return model;
 
-    const withFree = `${modelId}:free`;
     model = ctx.modelRegistry.find(provider, withFree);
     if (model) return model;
 
-    // 3. 扫描可用模型列表容错匹配
+    // 3. 在可用模型列表中严格匹配
     const available = ctx.modelRegistry.getAvailable();
-    const match = available.find(
-      (m: { provider: string; id: string }) =>
-        m.provider.toLowerCase() === provider.toLowerCase() &&
-        (m.id.toLowerCase() === modelId.toLowerCase() ||
-          m.id.toLowerCase() === stripped.toLowerCase() ||
-          m.id.toLowerCase().endsWith(stripped.toLowerCase())),
-    );
+    const match = available.find((m: { provider: string; id: string }) => {
+      if (m.provider.toLowerCase() !== pLower) return false;
+      const idLower = m.id.toLowerCase();
+      return idLower === mLower || idLower === strippedLower || idLower === withFreeLower;
+    });
+
     if (match) {
       return ctx.modelRegistry.find(match.provider, match.id);
     }
@@ -88,6 +93,9 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  /**
+   * 切换底层模型 (G6: 异常全面收敛，返回确定性布尔值)
+   */
   async function setModelTo(ctx: ExtensionContext, slot: ModelSlot): Promise<boolean> {
     try {
       const model = findModelInRegistry(ctx, slot.provider, slot.model);
@@ -99,7 +107,9 @@ export default function (pi: ExtensionAPI) {
       if (ok === false) return false;
       try {
         pi.setThinkingLevel(slot.thinking);
-      } catch {}
+      } catch (err) {
+        console.warn("[pi-auto-models] Failed to set thinking level:", err);
+      }
       return true;
     } catch (e) {
       console.error("[pi-auto-models] setModelTo error:", e);
@@ -121,7 +131,7 @@ export default function (pi: ExtensionAPI) {
 
     if (slotIdx !== -1) {
       // 场景 1：用户当前使用的是 M1~M4 槽位模型，更新记忆
-      lastSlotIndex = slotIdx;
+      lastSlotIndex = Math.max(0, Math.min(slotIdx, modelChain.length - 1));
       ctx.ui.setStatus(
         "auto-model",
         ctx.ui.theme.fg(slotIdx === 0 ? "success" : "warning", `⚡ [M${slotIdx + 1}] ${modelChain[slotIdx].model}`),
@@ -160,13 +170,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 原生重试接续 (防御异步 Promise Rejection)
+   * 原生重试接续 (G4: 统一错误通知入口与去重防护)
    */
   function triggerAutoRetry(ctx: ExtensionContext, slotIndex: number, modelName: string) {
     const anyPi = pi as any;
     const anyCtx = ctx as any;
+    let notified = false;
 
     const notifyFallbackReady = () => {
+      if (notified) return;
+      notified = true;
       ctx.ui.notify(`[M${slotIndex + 1}] ${modelName} 已就绪，请按 Enter 继续`, "info");
     };
 
@@ -194,7 +207,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 核心故障接管逻辑 (带多槽位链式顺推寻路 + 避障机制)
+   * 核心故障接管逻辑 (G1: finally 保证释放互斥锁，多槽位链式顺推 + 避障机制)
    */
   async function triggerFallback(ctx: ExtensionContext, reason: string) {
     const now = Date.now();
@@ -208,6 +221,8 @@ export default function (pi: ExtensionAPI) {
     clearRetryTimer();
     isFallbackInProgress = true;
 
+    let timerScheduled = false;
+
     try {
       const currentProvider = ctx.model?.provider;
       const currentModelId = ctx.model?.id;
@@ -215,8 +230,8 @@ export default function (pi: ExtensionAPI) {
 
       let startIndex: number;
       if (currentSlotIdx === -1) {
-        // 当前为外部手工模型：从切走前记忆的 lastSlotIndex 槽位作为起始寻路点
-        startIndex = lastSlotIndex;
+        // 当前为外部手工模型：从切走前记忆的 lastSlotIndex 槽位作为起始寻路点 (G5: 边界校验)
+        startIndex = Math.max(0, Math.min(lastSlotIndex, modelChain.length - 1));
       } else {
         // 当前为槽位模型：顺推到下一个槽位
         startIndex = (currentSlotIdx + 1) % modelChain.length;
@@ -246,16 +261,16 @@ export default function (pi: ExtensionAPI) {
         });
 
         if (ok) {
-          lastSlotIndex = targetIndex;
+          lastSlotIndex = Math.max(0, Math.min(targetIndex, modelChain.length - 1));
           switched = true;
+          timerScheduled = true;
 
           // 1.5 秒防雪崩节流延迟后发起自动重试
           retryTimer = setTimeout(() => {
             try {
               triggerAutoRetry(ctx, targetIndex, targetSlot.model);
             } finally {
-              isFallbackInProgress = false;
-              retryTimer = null;
+              clearRetryTimer();
             }
           }, 1500);
           return;
@@ -265,17 +280,19 @@ export default function (pi: ExtensionAPI) {
       if (!switched) {
         console.warn("[pi-auto-models] All fallback slots failed to activate.");
         ctx.ui.notify(`[pi-auto-models] 降级链中所有卡槽模型均不可用，请检查配置`, "error");
-        lastFallbackTimestamp = 0; // 重置冷却，以便用户手动操作后能即刻响应
+        lastFallbackTimestamp = 0;
       }
     } catch (err) {
       console.error("[pi-auto-models] Fallback error:", err);
       lastFallbackTimestamp = 0;
+    } finally {
+      if (!timerScheduled) {
+        isFallbackInProgress = false;
+      }
     }
-
-    isFallbackInProgress = false;
   }
 
-  // 1. 监听会话启动与恢复
+  // 1. 监听会话启动、恢复与退出销毁 (G2: session_shutdown 清理句柄)
   pi.on("session_start", async (_event, ctx) => {
     clearRetryTimer();
     modelChain = readConfig();
@@ -286,6 +303,10 @@ export default function (pi: ExtensionAPI) {
     clearRetryTimer();
     modelChain = readConfig();
     syncModelStatus(ctx);
+  });
+
+  pi.on("session_shutdown", async () => {
+    clearRetryTimer();
   });
 
   // 2. 监听回合开始 (用户发送消息触发) 与 请求前，实时感知并同步手工切换的模型
@@ -357,7 +378,7 @@ export default function (pi: ExtensionAPI) {
           };
         });
 
-        const list = new SelectList(items, 4, {
+        const list = new SelectList(items, MAX_SLOTS, {
           selectedPrefix: (t) => theme.fg("accent", t),
           selectedText: (t) => theme.fg("accent", t),
           description: (t) => theme.fg("muted", t),
@@ -500,9 +521,10 @@ export default function (pi: ExtensionAPI) {
       const [provider, ...rest] = chosenModel.split("/");
       const modelId = rest.join("/");
 
-      while (modelChain.length < 4) {
+      while (modelChain.length < MAX_SLOTS) {
         modelChain.push(DEFAULT_MODELS[modelChain.length]);
       }
+      modelChain = modelChain.slice(0, MAX_SLOTS);
       modelChain[targetIndex] = {
         provider,
         model: modelId,

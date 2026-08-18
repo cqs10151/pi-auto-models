@@ -1,6 +1,6 @@
 {
   "name": "pi-auto-models",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Auto-switch pi across a 4-tier model fallback chain on any error (400/429/529/unusable), with intent-aware manual override.",
   "repository": {
     "type": "git",
