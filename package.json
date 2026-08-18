@@ -13,7 +13,6 @@
   "files": [
     "index.ts",
     "quota-data.ts",
-    "quota-utils.ts",
     "README.md",
     "LICENSE"
   ],

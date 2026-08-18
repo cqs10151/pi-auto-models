@@ -48,7 +48,7 @@ function safeWriteJsonSync(filePath: string, data: unknown): void {
     writeFileSync(tempPath, JSON.stringify(data, null, 2), "utf-8");
     renameSync(tempPath, filePath);
   } catch (err) {
-    console.error(`[pi-auto-models] Failed to write ${filePath}:`, err);
+    console.error("[pi-auto-models] Failed to write config:", err);
   }
 }
 
