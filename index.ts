@@ -19,9 +19,24 @@ export default function (pi: ExtensionAPI) {
   let modelChain: ModelSlot[] = readConfig();
 
   // 状态机核心变量
-  let lastSlotIndex: number = 0;         // 记忆最后一次有效的槽位索引 (0..3 对应 M1..M4，默认 M1)
-  let isPluginSwitching: boolean = false; // 标识是否为插件内部发起的切换
-  let isFallbackInProgress: boolean = false; // 降级与重试执行互斥锁
+  let lastSlotIndex: number = 0;              // 记忆最后一次有效的槽位索引 (0..3 对应 M1..M4，默认 M1)
+  let isPluginSwitching: boolean = false;      // 标识是否为插件内部发起的切换
+  let isFallbackInProgress: boolean = false;   // 降级与重试执行互斥锁
+  let retryTimer: NodeJS.Timeout | null = null;// 重试节流定时器句柄 (防止悬挂与幽灵重试)
+  let lastFallbackTimestamp: number = 0;       // 上次降级触发时间戳 (双事件防抖)
+
+  const FALLBACK_COOLDOWN_MS = 2000;          // 双拦截事件防抖冷却窗口 (2秒)
+
+  /**
+   * 清理悬挂定时器并重置降级锁
+   */
+  function clearRetryTimer() {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    isFallbackInProgress = false;
+  }
 
   function findSlotIndex(provider?: string, modelId?: string): number {
     if (!provider || !modelId) return -1;
@@ -29,14 +44,45 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function setModelTo(ctx: ExtensionContext, slot: ModelSlot): Promise<boolean> {
-    const model = ctx.modelRegistry.find(slot.provider, slot.model);
-    if (!model) return false;
-    const ok = await pi.setModel(model);
-    if (!ok) return false;
     try {
-      pi.setThinkingLevel(slot.thinking);
-    } catch {}
-    return true;
+      const model = ctx.modelRegistry.find(slot.provider, slot.model);
+      if (!model) return false;
+      const ok = await pi.setModel(model);
+      // 加固项 3：严格判断 ok === false，避免 SDK 成功返回 void (undefined) 时发生假阴性误判
+      if (ok === false) return false;
+      try {
+        pi.setThinkingLevel(slot.thinking);
+      } catch {}
+      return true;
+    } catch (e) {
+      console.error("[pi-auto-models] setModelTo error:", e);
+      return false;
+    }
+  }
+
+  /**
+   * 统一模型状态感知与状态栏同步函数 (惰性检查与被动同步)
+   */
+  function syncModelStatus(ctx: ExtensionContext) {
+    if (isPluginSwitching) return;
+
+    const currentProvider = ctx.model?.provider;
+    const currentModelId = ctx.model?.id;
+    if (!currentProvider || !currentModelId) return;
+
+    const slotIdx = findSlotIndex(currentProvider, currentModelId);
+
+    if (slotIdx !== -1) {
+      // 场景 1：用户当前使用的是 M1~M4 槽位模型，更新记忆
+      lastSlotIndex = slotIdx;
+      ctx.ui.setStatus(
+        "auto-model",
+        ctx.ui.theme.fg(slotIdx === 0 ? "success" : "warning", `⚡ [M${slotIdx + 1}] ${modelChain[slotIdx].model}`),
+      );
+    } else {
+      // 场景 2 (方案 1)：用户切到外部独立模型，保留 lastSlotIndex 记忆不变，仅更新状态栏
+      ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("muted", `⚡ [Manual] ${currentModelId}`));
+    }
   }
 
   /**
@@ -67,25 +113,37 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 原生重试接续
+   * 原生重试接续 (加固项 2：防御异步 Promise Rejection)
    */
   function triggerAutoRetry(ctx: ExtensionContext, slotIndex: number, modelName: string) {
     const anyPi = pi as any;
     const anyCtx = ctx as any;
 
-    try {
-      if (typeof anyPi.retry === "function") {
-        anyPi.retry();
-      } else if (typeof anyPi.retryTurn === "function") {
-        anyPi.retryTurn();
-      } else if (typeof anyCtx.retry === "function") {
-        anyCtx.retry();
-      } else {
-        ctx.ui.notify(`[M${slotIndex + 1}] ${modelName} 已就绪，请按 Enter 继续`, "info");
-      }
-    } catch (e) {
-      console.error("[pi-auto-models] Auto retry failed:", e);
+    const notifyFallbackReady = () => {
       ctx.ui.notify(`[M${slotIndex + 1}] ${modelName} 已就绪，请按 Enter 继续`, "info");
+    };
+
+    try {
+      let retryResult: any = null;
+      if (typeof anyPi.retry === "function") {
+        retryResult = anyPi.retry();
+      } else if (typeof anyPi.retryTurn === "function") {
+        retryResult = anyPi.retryTurn();
+      } else if (typeof anyCtx.retry === "function") {
+        retryResult = anyCtx.retry();
+      } else {
+        notifyFallbackReady();
+        return;
+      }
+
+      // 包装为 Promise 捕获异步异常，杜绝 UnhandledPromiseRejection 导致进程崩溃
+      Promise.resolve(retryResult).catch((err) => {
+        console.error("[pi-auto-models] Async auto retry error:", err);
+        notifyFallbackReady();
+      });
+    } catch (e) {
+      console.error("[pi-auto-models] Auto retry invocation error:", e);
+      notifyFallbackReady();
     }
   }
 
@@ -93,8 +151,17 @@ export default function (pi: ExtensionAPI) {
    * 核心故障接管逻辑
    */
   async function triggerFallback(ctx: ExtensionContext, reason: string) {
-    if (isFallbackInProgress) return;
+    const now = Date.now();
+    // 加固项 4：双重拦截事件防抖冷却
+    if (isFallbackInProgress || (now - lastFallbackTimestamp < FALLBACK_COOLDOWN_MS)) {
+      return;
+    }
     isFallbackInProgress = true;
+    lastFallbackTimestamp = now;
+
+    // 加固项 1：清除上一轮可能存在的旧定时器
+    clearRetryTimer();
+    isFallbackInProgress = true; // 清理后重设互斥锁
 
     try {
       const currentProvider = ctx.model?.provider;
@@ -103,7 +170,7 @@ export default function (pi: ExtensionAPI) {
 
       let targetIndex: number;
       if (currentSlotIdx === -1) {
-        // 当前为外部手工模型：从手工切换前记录的槽位状态开始（如 M2 切换外部挂掉，继续尝试 M2）
+        // 当前为外部手工模型：从切走前记忆的 lastSlotIndex 槽位接管
         targetIndex = lastSlotIndex;
       } else {
         // 当前为槽位模型：顺推到下一个槽位并循环 (M1->M2->M3->M4->M1...)
@@ -120,12 +187,13 @@ export default function (pi: ExtensionAPI) {
 
       if (ok) {
         lastSlotIndex = targetIndex;
-        // 1.5 秒防雪崩节流延迟后，发起自动重试
-        setTimeout(() => {
+        // 加固项 1：保存定时器句柄，以便生命周期干预时清理
+        retryTimer = setTimeout(() => {
           try {
             triggerAutoRetry(ctx, targetIndex, targetSlot.model);
           } finally {
             isFallbackInProgress = false;
+            retryTimer = null;
           }
         }, 1500);
         return;
@@ -136,41 +204,27 @@ export default function (pi: ExtensionAPI) {
     isFallbackInProgress = false;
   }
 
-  // 1. 监听会话启动
+  // 1. 监听会话启动与恢复
   pi.on("session_start", async (_event, ctx) => {
+    clearRetryTimer();
     modelChain = readConfig();
-    const currentSlotIdx = findSlotIndex(ctx.model?.provider, ctx.model?.id);
-
-    if (currentSlotIdx !== -1) {
-      lastSlotIndex = currentSlotIdx;
-      ctx.ui.setStatus(
-        "auto-model",
-        ctx.ui.theme.fg(currentSlotIdx === 0 ? "success" : "warning", `⚡ [M${currentSlotIdx + 1}] ${modelChain[currentSlotIdx].model}`),
-      );
-    } else if (ctx.model?.id) {
-      ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("muted", `⚡ [Manual] ${ctx.model.id}`));
-    }
+    syncModelStatus(ctx);
   });
 
-  // 2. 监听用户手工切换模型
-  pi.on("model_change", (event, ctx) => {
-    if (isPluginSwitching) return;
+  pi.on("session_resume", async (_event, ctx) => {
+    clearRetryTimer();
+    modelChain = readConfig();
+    syncModelStatus(ctx);
+  });
 
-    const newProvider = event.model?.provider ?? ctx.model?.provider;
-    const newModelId = event.model?.id ?? ctx.model?.id;
-    const slotIdx = findSlotIndex(newProvider, newModelId);
+  // 2. 监听回合开始 (用户发送消息触发) 与 请求前，实时感知并同步手工切换的模型
+  pi.on("turn_start", async (_event, ctx) => {
+    clearRetryTimer(); // 用户主动发送新消息，立即取消旧重试定时器
+    syncModelStatus(ctx);
+  });
 
-    if (slotIdx !== -1) {
-      // 用户手工切到 M1~M4 其中一个槽位
-      lastSlotIndex = slotIdx;
-      ctx.ui.setStatus(
-        "auto-model",
-        ctx.ui.theme.fg(slotIdx === 0 ? "success" : "warning", `⚡ [M${slotIdx + 1}] ${modelChain[slotIdx].model}`),
-      );
-    } else if (newModelId) {
-      // 用户手工切到外部独立模型：保留 lastSlotIndex 不变，更新显示
-      ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("muted", `⚡ [Manual] ${newModelId}`));
-    }
+  pi.on("before_provider_request", async (_event, ctx) => {
+    syncModelStatus(ctx);
   });
 
   // 3. HTTP 级响应拦截
@@ -198,8 +252,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // 忽略用户主动取消 / 中断场景
+    // 忽略用户主动取消 / 中断场景，并清理待触发定时器
     if (/abort|cancel|interrupted|context canceled/i.test(err)) {
+      clearRetryTimer();
       return;
     }
 
@@ -390,6 +445,8 @@ export default function (pi: ExtensionAPI) {
       const curSlotIdx = findSlotIndex(ctx.model?.provider, ctx.model?.id);
       if (curSlotIdx === targetIndex) {
         await switchModelSlot(ctx, targetIndex, modelChain[targetIndex]);
+      } else {
+        syncModelStatus(ctx);
       }
     },
   });
