@@ -38,17 +38,64 @@ export default function (pi: ExtensionAPI) {
     isFallbackInProgress = false;
   }
 
+  /**
+   * 容错匹配注册表中的模型 (支持 :free 后缀/大小写容错)
+   */
+  function findModelInRegistry(ctx: ExtensionContext, provider: string, modelId: string) {
+    // 1. 精确查找
+    let model = ctx.modelRegistry.find(provider, modelId);
+    if (model) return model;
+
+    // 2. 剥离/追加 :free 变体查找
+    const stripped = modelId.replace(/:free$/i, "");
+    model = ctx.modelRegistry.find(provider, stripped);
+    if (model) return model;
+
+    const withFree = `${modelId}:free`;
+    model = ctx.modelRegistry.find(provider, withFree);
+    if (model) return model;
+
+    // 3. 扫描可用模型列表容错匹配
+    const available = ctx.modelRegistry.getAvailable();
+    const match = available.find(
+      (m: { provider: string; id: string }) =>
+        m.provider.toLowerCase() === provider.toLowerCase() &&
+        (m.id.toLowerCase() === modelId.toLowerCase() ||
+          m.id.toLowerCase() === stripped.toLowerCase() ||
+          m.id.toLowerCase().endsWith(stripped.toLowerCase())),
+    );
+    if (match) {
+      return ctx.modelRegistry.find(match.provider, match.id);
+    }
+
+    return null;
+  }
+
+  /**
+   * 匹配当前模型在 M1~M4 槽位中的索引
+   */
   function findSlotIndex(provider?: string, modelId?: string): number {
     if (!provider || !modelId) return -1;
-    return modelChain.findIndex((s) => s.provider === provider && s.model === modelId);
+    const p = provider.trim().toLowerCase();
+    const m = modelId.trim().toLowerCase();
+    const mStripped = m.replace(/:free$/i, "");
+
+    return modelChain.findIndex((s) => {
+      const sp = s.provider.trim().toLowerCase();
+      const sm = s.model.trim().toLowerCase();
+      const smStripped = sm.replace(/:free$/i, "");
+      return sp === p && (sm === m || smStripped === mStripped);
+    });
   }
 
   async function setModelTo(ctx: ExtensionContext, slot: ModelSlot): Promise<boolean> {
     try {
-      const model = ctx.modelRegistry.find(slot.provider, slot.model);
-      if (!model) return false;
+      const model = findModelInRegistry(ctx, slot.provider, slot.model);
+      if (!model) {
+        console.warn(`[pi-auto-models] Model not found in registry: ${slot.provider}/${slot.model}`);
+        return false;
+      }
       const ok = await pi.setModel(model);
-      // 加固项 3：严格判断 ok === false，避免 SDK 成功返回 void (undefined) 时发生假阴性误判
       if (ok === false) return false;
       try {
         pi.setThinkingLevel(slot.thinking);
@@ -113,7 +160,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 原生重试接续 (加固项 2：防御异步 Promise Rejection)
+   * 原生重试接续 (防御异步 Promise Rejection)
    */
   function triggerAutoRetry(ctx: ExtensionContext, slotIndex: number, modelName: string) {
     const anyPi = pi as any;
@@ -136,7 +183,6 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // 包装为 Promise 捕获异步异常，杜绝 UnhandledPromiseRejection 导致进程崩溃
       Promise.resolve(retryResult).catch((err) => {
         console.error("[pi-auto-models] Async auto retry error:", err);
         notifyFallbackReady();
@@ -148,59 +194,84 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 核心故障接管逻辑
+   * 核心故障接管逻辑 (带多槽位链式顺推寻路 + 避障机制)
    */
   async function triggerFallback(ctx: ExtensionContext, reason: string) {
     const now = Date.now();
-    // 加固项 4：双重拦截事件防抖冷却
+    // 双重拦截事件防抖冷却
     if (isFallbackInProgress || (now - lastFallbackTimestamp < FALLBACK_COOLDOWN_MS)) {
       return;
     }
     isFallbackInProgress = true;
     lastFallbackTimestamp = now;
 
-    // 加固项 1：清除上一轮可能存在的旧定时器
     clearRetryTimer();
-    isFallbackInProgress = true; // 清理后重设互斥锁
+    isFallbackInProgress = true;
 
     try {
       const currentProvider = ctx.model?.provider;
       const currentModelId = ctx.model?.id;
       const currentSlotIdx = findSlotIndex(currentProvider, currentModelId);
 
-      let targetIndex: number;
+      let startIndex: number;
       if (currentSlotIdx === -1) {
-        // 当前为外部手工模型：从切走前记忆的 lastSlotIndex 槽位接管
-        targetIndex = lastSlotIndex;
+        // 当前为外部手工模型：从切走前记忆的 lastSlotIndex 槽位作为起始寻路点
+        startIndex = lastSlotIndex;
       } else {
-        // 当前为槽位模型：顺推到下一个槽位并循环 (M1->M2->M3->M4->M1...)
-        targetIndex = (currentSlotIdx + 1) % modelChain.length;
+        // 当前为槽位模型：顺推到下一个槽位
+        startIndex = (currentSlotIdx + 1) % modelChain.length;
       }
 
-      const targetSlot = modelChain[targetIndex];
       const prevModelLabel = currentModelId || "当前模型";
+      let switched = false;
 
-      const ok = await switchModelSlot(ctx, targetIndex, targetSlot, {
-        text: `[${prevModelLabel}] 异常 (${reason}) -> 已自动接管至 [M${targetIndex + 1}] ${targetSlot.model}`,
-        level: "warning",
-      });
+      // 核心加固：循环遍历整个槽位链条，直到找到第一个可用的有效槽位
+      for (let step = 0; step < modelChain.length; step++) {
+        const targetIndex = (startIndex + step) % modelChain.length;
+        const targetSlot = modelChain[targetIndex];
 
-      if (ok) {
-        lastSlotIndex = targetIndex;
-        // 加固项 1：保存定时器句柄，以便生命周期干预时清理
-        retryTimer = setTimeout(() => {
-          try {
-            triggerAutoRetry(ctx, targetIndex, targetSlot.model);
-          } finally {
-            isFallbackInProgress = false;
-            retryTimer = null;
-          }
-        }, 1500);
-        return;
+        // 避障保护：绝不向当前正在报错的同一个模型切换
+        if (
+          currentProvider &&
+          currentModelId &&
+          targetSlot.provider.toLowerCase() === currentProvider.toLowerCase() &&
+          targetSlot.model.replace(/:free$/i, "").toLowerCase() === currentModelId.replace(/:free$/i, "").toLowerCase()
+        ) {
+          continue;
+        }
+
+        const ok = await switchModelSlot(ctx, targetIndex, targetSlot, {
+          text: `[${prevModelLabel}] 异常 (${reason}) -> 已自动接管至 [M${targetIndex + 1}] ${targetSlot.model}`,
+          level: "warning",
+        });
+
+        if (ok) {
+          lastSlotIndex = targetIndex;
+          switched = true;
+
+          // 1.5 秒防雪崩节流延迟后发起自动重试
+          retryTimer = setTimeout(() => {
+            try {
+              triggerAutoRetry(ctx, targetIndex, targetSlot.model);
+            } finally {
+              isFallbackInProgress = false;
+              retryTimer = null;
+            }
+          }, 1500);
+          return;
+        }
+      }
+
+      if (!switched) {
+        console.warn("[pi-auto-models] All fallback slots failed to activate.");
+        ctx.ui.notify(`[pi-auto-models] 降级链中所有卡槽模型均不可用，请检查配置`, "error");
+        lastFallbackTimestamp = 0; // 重置冷却，以便用户手动操作后能即刻响应
       }
     } catch (err) {
       console.error("[pi-auto-models] Fallback error:", err);
+      lastFallbackTimestamp = 0;
     }
+
     isFallbackInProgress = false;
   }
 
